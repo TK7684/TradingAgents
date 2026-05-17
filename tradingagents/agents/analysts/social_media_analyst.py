@@ -1,6 +1,11 @@
+import logging
+
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction, get_news
 from tradingagents.dataflows.config import get_config
+from tradingagents.crypto_regime import get_regime_context
+
+log = logging.getLogger(__name__)
 
 
 def create_social_media_analyst(llm):
@@ -17,6 +22,11 @@ def create_social_media_analyst(llm):
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + get_language_instruction()
         )
+
+        # Inject crypto market regime context if available
+        regime_ctx = get_regime_context()
+        if regime_ctx:
+            system_message += regime_ctx
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -40,13 +50,19 @@ def create_social_media_analyst(llm):
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        chain = prompt | llm.bind_tools(tools)
+        tool_binding_failed = False
+        try:
+            chain = prompt | llm.bind_tools(tools)
+        except (NotImplementedError, AttributeError, TypeError) as e:
+            log.warning(f"Tool binding failed, using text-only mode: {e}")
+            chain = prompt | llm
+            tool_binding_failed = True
 
         result = chain.invoke(state["messages"])
 
         report = ""
 
-        if len(result.tool_calls) == 0:
+        if tool_binding_failed or not hasattr(result, 'tool_calls') or len(result.tool_calls) == 0:
             report = result.content
 
         return {

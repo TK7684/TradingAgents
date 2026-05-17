@@ -1,3 +1,5 @@
+import logging
+
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
@@ -6,6 +8,9 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
 )
 from tradingagents.dataflows.config import get_config
+from tradingagents.crypto_regime import get_regime_context
+
+log = logging.getLogger(__name__)
 
 
 def create_market_analyst(llm):
@@ -27,6 +32,12 @@ Moving Averages:
 - close_200_sma: 200 SMA: A long-term trend benchmark. Usage: Confirm overall market trend and identify golden/death cross setups. Tips: It reacts slowly; best for strategic trend confirmation rather than frequent trading entries.
 - close_10_ema: 10 EMA: A responsive short-term average. Usage: Capture quick shifts in momentum and potential entry points. Tips: Prone to noise in choppy markets; use alongside longer averages for filtering false signals.
 
+Smoothed Moving Averages (SMMA):
+- close_21_smma: 21 SMMA: Short-term trend with smoothed response. Part of 'The Arty' small cloud (21 vs 50 SMMA). Usage: Cloud crossovers signal trend changes; above 50 SMMA indicates bullish micro-trend. Tips: More responsive than SMA but less reactive than EMA; ideal for swing trading signals.
+- close_50_smma: 50 SMMA: Medium-term trend anchor. Second part of small cloud (paired with 21 SMMA). Usage: When 21 SMMA crosses above 50 SMMA, bullish cloud forms; 21 below 50 signals bearish setup. Tips: Works well with SMMA cloud analysis for trend confirmation.
+- close_100_smma: 100 SMMA: Intermediate-term trend confirmation. Optional mid-level support/resistance. Usage: Helps confirm sustained trends between medium and long-term levels. Tips: Use as confirmation level when 21/50 cloud signals align with price above/below 100 SMMA.
+- close_200_smma: 200 SMMA: Long-term trend anchor and key bias filter. The Arty's primary trend filter. Usage: Price above 200 SMMA = long bias; price below = short bias. Combined with cloud for strong signals. Tips: When price is above 200 SMMA + bullish cloud (21>50), strong long setup. Opposite for shorts.
+
 MACD Related:
 - macd: MACD: Computes momentum via differences of EMAs. Usage: Look for crossovers and divergence as signals of trend changes. Tips: Confirm with other indicators in low-volatility or sideways markets.
 - macds: MACD Signal: An EMA smoothing of the MACD line. Usage: Use crossovers with the MACD line to trigger trades. Tips: Should be part of a broader strategy to avoid false positives.
@@ -44,10 +55,19 @@ Volatility Indicators:
 Volume-Based Indicators:
 - vwma: VWMA: A moving average weighted by volume. Usage: Confirm trends by integrating price action with volume data. Tips: Watch for skewed results from volume spikes; use in combination with other volume analyses.
 
-- Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context. When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_stock_data first to retrieve the CSV that is needed to generate indicators. Then use get_indicators with the specific indicator names. Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."""
+- Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context.
+
+**SMMA Cloud Strategy**: When analyzing crypto assets, prioritize SMMA cloud analysis (21 vs 50 SMMA) for primary trend signals. Use the cloud in combination with the 200 SMMA as the ultimate bias filter: Cloud bullish (21 > 50) + price > 200 SMMA = strong long setup. Cloud bearish (21 < 50) + price < 200 SMMA = strong short setup. Cloud crossovers often precede significant trend changes.
+
+When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_stock_data first to retrieve the CSV that is needed to generate indicators. Then use get_indicators with the specific indicator names. Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."""
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + get_language_instruction()
         )
+
+        # Inject crypto market regime context if available
+        regime_ctx = get_regime_context()
+        if regime_ctx:
+            system_message += regime_ctx
 
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -71,13 +91,19 @@ Volume-Based Indicators:
         prompt = prompt.partial(current_date=current_date)
         prompt = prompt.partial(instrument_context=instrument_context)
 
-        chain = prompt | llm.bind_tools(tools)
+        tool_binding_failed = False
+        try:
+            chain = prompt | llm.bind_tools(tools)
+        except (NotImplementedError, AttributeError, TypeError) as e:
+            log.warning(f"Tool binding failed, using text-only mode: {e}")
+            chain = prompt | llm
+            tool_binding_failed = True
 
         result = chain.invoke(state["messages"])
 
         report = ""
 
-        if len(result.tool_calls) == 0:
+        if tool_binding_failed or not hasattr(result, 'tool_calls') or len(result.tool_calls) == 0:
             report = result.content
 
         return {

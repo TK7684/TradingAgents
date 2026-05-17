@@ -8,6 +8,7 @@ from tradingagents.agents import *
 from tradingagents.agents.utils.agent_states import AgentState
 
 from .conditional_logic import ConditionalLogic
+from .analyst_subgraph import create_analyst_subgraph
 
 
 class GraphSetup:
@@ -39,7 +40,13 @@ class GraphSetup:
     def setup_graph(
         self, selected_analysts=["market", "social", "news", "fundamentals"]
     ):
-        """Set up and compile the agent workflow graph.
+        """Set up and compile the agent workflow graph with parallel analyst execution.
+
+        The analyst nodes (market, social, news, fundamentals, polymarket) run
+        concurrently using a fan-out/fan-in pattern. Each analyst is wrapped in
+        its own subgraph that handles the tool-calling loop internally. All
+        subgraphs start from START and their outputs are merged before the
+        debate phase begins.
 
         Args:
             selected_analysts (list): List of analyst types to include. Options are:
@@ -52,47 +59,49 @@ class GraphSetup:
         if len(selected_analysts) == 0:
             raise ValueError("Trading Agents Graph Setup Error: no analysts selected!")
 
-        # Create analyst nodes
-        analyst_nodes = {}
-        delete_nodes = {}
-        tool_nodes = {}
+        # ------------------------------------------------------------------
+        # 1. Create analyst nodes and their tool-calling subgraphs
+        # ------------------------------------------------------------------
+        analyst_subgraphs = {}
 
         if "market" in selected_analysts:
-            analyst_nodes["market"] = create_market_analyst(
-                self.quick_thinking_llm
+            analyst_subgraphs["market"] = create_analyst_subgraph(
+                analyst_type="market",
+                analyst_node=create_market_analyst(self.quick_thinking_llm),
+                tool_node=self.tool_nodes["market"],
             )
-            delete_nodes["market"] = create_msg_delete()
-            tool_nodes["market"] = self.tool_nodes["market"]
 
         if "social" in selected_analysts:
-            analyst_nodes["social"] = create_social_media_analyst(
-                self.quick_thinking_llm
+            analyst_subgraphs["social"] = create_analyst_subgraph(
+                analyst_type="social",
+                analyst_node=create_social_media_analyst(self.quick_thinking_llm),
+                tool_node=self.tool_nodes["social"],
             )
-            delete_nodes["social"] = create_msg_delete()
-            tool_nodes["social"] = self.tool_nodes["social"]
 
         if "news" in selected_analysts:
-            analyst_nodes["news"] = create_news_analyst(
-                self.quick_thinking_llm
+            analyst_subgraphs["news"] = create_analyst_subgraph(
+                analyst_type="news",
+                analyst_node=create_news_analyst(self.quick_thinking_llm),
+                tool_node=self.tool_nodes["news"],
             )
-            delete_nodes["news"] = create_msg_delete()
-            tool_nodes["news"] = self.tool_nodes["news"]
 
         if "fundamentals" in selected_analysts:
-            analyst_nodes["fundamentals"] = create_fundamentals_analyst(
-                self.quick_thinking_llm
+            analyst_subgraphs["fundamentals"] = create_analyst_subgraph(
+                analyst_type="fundamentals",
+                analyst_node=create_fundamentals_analyst(self.quick_thinking_llm),
+                tool_node=self.tool_nodes["fundamentals"],
             )
-            delete_nodes["fundamentals"] = create_msg_delete()
-            tool_nodes["fundamentals"] = self.tool_nodes["fundamentals"]
 
         if "polymarket" in selected_analysts:
-            analyst_nodes["polymarket"] = create_polymarket_analyst(
-                self.quick_thinking_llm
+            analyst_subgraphs["polymarket"] = create_analyst_subgraph(
+                analyst_type="polymarket",
+                analyst_node=create_polymarket_analyst(self.quick_thinking_llm),
+                tool_node=self.tool_nodes["polymarket"],
             )
-            delete_nodes["polymarket"] = create_msg_delete()
-            tool_nodes["polymarket"] = self.tool_nodes["polymarket"]
 
-        # Create researcher and manager nodes
+        # ------------------------------------------------------------------
+        # 2. Create researcher and manager nodes
+        # ------------------------------------------------------------------
         bull_researcher_node = create_bull_researcher(
             self.quick_thinking_llm, self.bull_memory
         )
@@ -112,18 +121,33 @@ class GraphSetup:
             self.deep_thinking_llm, self.portfolio_manager_memory
         )
 
-        # Create workflow
+        # ------------------------------------------------------------------
+        # 3. Build the parent workflow graph
+        # ------------------------------------------------------------------
         workflow = StateGraph(AgentState)
 
-        # Add analyst nodes to the graph
-        for analyst_type, node in analyst_nodes.items():
-            workflow.add_node(f"{analyst_type.capitalize()} Analyst", node)
-            workflow.add_node(
-                f"Msg Clear {analyst_type.capitalize()}", delete_nodes[analyst_type]
-            )
-            workflow.add_node(f"tools_{analyst_type}", tool_nodes[analyst_type])
+        # -- Fan-out: add each analyst subgraph as a node --
+        for analyst_type, subgraph in analyst_subgraphs.items():
+            workflow.add_node(f"{analyst_type}_analyst_group", subgraph)
 
-        # Add other nodes
+        # -- Sync node: clear messages after all parallel analysts finish --
+        def clear_analyst_messages(state):
+            """Clear accumulated analyst messages and keep only a placeholder.
+            
+            After parallel analyst execution, the messages list contains
+            tool-call artifacts from all analysts. Since downstream nodes
+            (Bull/Bear researchers, etc.) don't read messages — they use
+            the report fields — we clear them to keep state clean.
+            """
+            from langchain_core.messages import HumanMessage, RemoveMessage
+            messages = state["messages"]
+            removal_operations = [RemoveMessage(id=m.id) for m in messages]
+            placeholder = HumanMessage(content="Analysts complete. Proceeding to debate.")
+            return {"messages": removal_operations + [placeholder]}
+
+        workflow.add_node("clear_analyst_messages", clear_analyst_messages)
+
+        # Add debate/risk nodes
         workflow.add_node("Bull Researcher", bull_researcher_node)
         workflow.add_node("Bear Researcher", bear_researcher_node)
         workflow.add_node("Research Manager", research_manager_node)
@@ -133,33 +157,21 @@ class GraphSetup:
         workflow.add_node("Conservative Analyst", conservative_analyst)
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
 
-        # Define edges
-        # Start with the first analyst
-        first_analyst = selected_analysts[0]
-        workflow.add_edge(START, f"{first_analyst.capitalize()} Analyst")
+        # ------------------------------------------------------------------
+        # 4. Define edges — fan-out / fan-in pattern
+        # ------------------------------------------------------------------
 
-        # Connect analysts in sequence
-        for i, analyst_type in enumerate(selected_analysts):
-            current_analyst = f"{analyst_type.capitalize()} Analyst"
-            current_tools = f"tools_{analyst_type}"
-            current_clear = f"Msg Clear {analyst_type.capitalize()}"
+        # Fan-out: START -> all analyst subgraphs (runs in parallel)
+        for analyst_type in analyst_subgraphs:
+            workflow.add_edge(START, f"{analyst_type}_analyst_group")
 
-            # Add conditional edges for current analyst
-            workflow.add_conditional_edges(
-                current_analyst,
-                getattr(self.conditional_logic, f"should_continue_{analyst_type}"),
-                [current_tools, current_clear],
-            )
-            workflow.add_edge(current_tools, current_analyst)
+        # Fan-in: all analyst subgraphs -> sync node -> debate
+        for analyst_type in analyst_subgraphs:
+            workflow.add_edge(f"{analyst_type}_analyst_group", "clear_analyst_messages")
 
-            # Connect to next analyst or to Bull Researcher if this is the last analyst
-            if i < len(selected_analysts) - 1:
-                next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
-                workflow.add_edge(current_clear, next_analyst)
-            else:
-                workflow.add_edge(current_clear, "Bull Researcher")
+        workflow.add_edge("clear_analyst_messages", "Bull Researcher")
 
-        # Add remaining edges
+        # Debate edges (unchanged)
         workflow.add_conditional_edges(
             "Bull Researcher",
             self.conditional_logic.should_continue_debate,

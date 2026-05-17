@@ -35,4 +35,11 @@ DEFAULT_CONFIG = {
     "tool_vendors": {
         # Example: "get_stock_data": "alpha_vantage",  # Override category default
     },
+    # LLM retry and timeout settings
+    "llm_timeout_seconds": 60,
+    "llm_max_retries": 3,
+    "llm_base_retry_delay": 2.0,
+    # Crypto trade history loading (hyperliquid-dex integration)
+    "load_crypto_history": False,
+    "crypto_history_db": "/home/tk578/hyperliquid-dex/trading.db",
 }

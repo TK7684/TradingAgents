@@ -1,0 +1,26 @@
+[
+  {
+    "action": "BUY",
+    "ticker": "NVDA",
+    "shares": 42,
+    "price": 235.74,
+    "cost": 9901.08,
+    "date": "2026-05-15"
+  },
+  {
+    "action": "BUY",
+    "ticker": "AAPL",
+    "shares": 33,
+    "price": 298.21,
+    "cost": 9840.929999999998,
+    "date": "2026-05-15"
+  },
+  {
+    "action": "BUY",
+    "ticker": "PLTR",
+    "shares": 74,
+    "price": 133.99,
+    "cost": 9915.26,
+    "date": "2026-05-15"
+  }
+]

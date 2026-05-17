@@ -105,6 +105,9 @@ class TradingAgentsGraph:
         self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config)
         self.portfolio_manager_memory = FinancialSituationMemory("portfolio_manager_memory", self.config)
 
+        # Lazy-load crypto trade history flag
+        self._crypto_trades_loaded = False
+
         # Create tool nodes
         self.tool_nodes = self._create_tool_nodes()
 
@@ -202,10 +205,32 @@ class TradingAgentsGraph:
             ),
         }
 
+    def _load_crypto_trades(self):
+        """Load crypto trade history from database if configured."""
+        try:
+            from tradingagents.agents.utils.crypto_memory_loader import CryptoTradeHistoryLoader
+            db_path = self.config.get("crypto_history_db", "/home/tk578/hyperliquid-dex/trading.db")
+            loader = CryptoTradeHistoryLoader(db_path)
+            trades = loader.load_closed_trades(limit=200)
+            if trades:
+                self.bull_memory.add_situations(trades)
+                self.bear_memory.add_situations(trades)
+                self.trader_memory.add_situations(trades)
+                import logging
+                logging.getLogger(__name__).info(f"Loaded {len(trades)} crypto trade memories")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Failed to load crypto trades: {e}")
+
     def propagate(self, company_name, trade_date):
         """Run the trading agents graph for a company on a specific date."""
 
         self.ticker = company_name
+
+        # Lazy-load crypto history on first propagate call if configured
+        if not self._crypto_trades_loaded and self.config.get("load_crypto_history", False):
+            self._load_crypto_trades()
+            self._crypto_trades_loaded = True
 
         # Initialize state
         init_agent_state = self.propagator.create_initial_state(

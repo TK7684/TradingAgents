@@ -76,6 +76,27 @@ def get_stock_stats_indicators_window(
             "Usage: Capture quick shifts in momentum and potential entry points. "
             "Tips: Prone to noise in choppy markets; use alongside longer averages for filtering false signals."
         ),
+        # Smoothed Moving Averages (SMMA) — supported by stockstats via close_N_smma naming convention
+        "close_21_smma": (
+            "21 SMMA: Short-term trend with smoothed response. Part of 'The Arty' small cloud (21 vs 50 SMMA). "
+            "Usage: Cloud crossovers signal trend changes; above 50 SMMA indicates bullish micro-trend. "
+            "Tips: More responsive than SMA but less reactive than EMA; ideal for swing trading signals."
+        ),
+        "close_50_smma": (
+            "50 SMMA: Medium-term trend anchor. Second part of small cloud (paired with 21 SMMA). "
+            "Usage: When 21 SMMA crosses above 50 SMMA, bullish cloud forms; 21 below 50 signals bearish setup. "
+            "Tips: Works well with SMMA cloud analysis for trend confirmation."
+        ),
+        "close_100_smma": (
+            "100 SMMA: Intermediate-term trend confirmation. Optional mid-level support/resistance. "
+            "Usage: Helps confirm sustained trends between medium and long-term levels. "
+            "Tips: Use as confirmation level when 21/50 cloud signals align with price above/below 100 SMMA."
+        ),
+        "close_200_smma": (
+            "200 SMMA: Long-term trend anchor and key bias filter. The Arty's primary trend filter. "
+            "Usage: Price above 200 SMMA = long bias; price below = short bias. Combined with cloud for strong signals. "
+            "Tips: When price is above 200 SMMA + bullish cloud (21>50), strong long setup. Opposite for shorts."
+        ),
         # MACD Related
         "macd": (
             "MACD: Computes momentum via differences of EMAs. "
