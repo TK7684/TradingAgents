@@ -25,10 +25,17 @@ def get_latest_trading_date():
     return today.strftime("%Y-%m-%d")
 
 
-def analyze_ticker(ticker, date, config=None):
+def analyze_ticker(ticker, date, config=None, timeout_seconds=600):
     """Analyze a single ticker using TradingAgents.
     
     Returns a dict with: ticker, date, decision, status, summary
+    
+    Args:
+        ticker: Stock ticker symbol
+        date: Analysis date (YYYY-MM-DD)
+        config: TradingAgents config dict
+        timeout_seconds: Hard timeout per ticker (default 600s = 10min).
+            Prevents hung LLM API calls from blocking the entire daily run.
     """
     try:
         sys.path.insert(0, BASE_DIR)

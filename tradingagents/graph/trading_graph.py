@@ -145,6 +145,15 @@ class TradingAgentsGraph:
         kwargs = {}
         provider = self.config.get("llm_provider", "").lower()
 
+        # Forward timeout from config to prevent hangs
+        if "llm_timeout_seconds" in self.config:
+            kwargs["timeout"] = self.config["llm_timeout_seconds"]
+
+        # LangChain retry for transient errors (timeouts, 429s).
+        # Keep low (2) — our rate_limiter prevents burst 429s,
+        # and inter-ticker delays prevent cross-ticker exhaustion.
+        kwargs["max_retries"] = 2
+
         if provider == "google":
             thinking_level = self.config.get("google_thinking_level")
             if thinking_level:

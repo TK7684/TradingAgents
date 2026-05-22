@@ -24,6 +24,15 @@ def create_research_manager(llm, memory):
 
 Summarize the key points from both sides concisely, focusing on the most compelling evidence or reasoning. Your recommendation—Buy, Sell, or Hold—must be clear and actionable. Avoid defaulting to Hold simply because both sides have valid points; commit to a stance grounded in the debate's strongest arguments.
 
+**EXPLICIT SELL CRITERIA — You MUST recommend SELL if ANY of the following are true:**
+- The stock price is down more than 5% from a recent entry and shows no signs of recovery
+- Fundamentals are deteriorating: declining revenue, shrinking margins, rising debt, or negative earnings revisions
+- Technical indicators show bearish divergence (e.g., price making lower highs while RSI/MACD makes higher highs, or price below key moving averages with bearish crossover signals)
+- The bear analyst's risk arguments significantly outweigh the bull's growth thesis
+- Negative catalysts: regulatory risks, competitive disruption, management issues, or sector headwinds
+
+Do NOT default to Buy or Hold. If risks are elevated and the downside case is credible, recommend SELL to protect capital.
+
 Additionally, develop a detailed investment plan for the trader. This should include:
 
 Your Recommendation: A decisive stance supported by the most convincing arguments.

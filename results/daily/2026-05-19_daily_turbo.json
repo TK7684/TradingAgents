@@ -1,0 +1,76 @@
+{
+  "date": "2026-05-19",
+  "profile": "turbo",
+  "results": [
+    {
+      "ticker": "NVDA",
+      "date": "2026-05-19",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY"
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2026-05-19",
+      "decision": "HOLD",
+      "status": "ok",
+      "summary": "HOLD"
+    },
+    {
+      "ticker": "TSLA",
+      "date": "2026-05-19",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY"
+    },
+    {
+      "ticker": "MSFT",
+      "date": "2026-05-19",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY"
+    },
+    {
+      "ticker": "GOOGL",
+      "date": "2026-05-19",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY"
+    },
+    {
+      "ticker": "AMZN",
+      "date": "2026-05-19",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY"
+    },
+    {
+      "ticker": "META",
+      "date": "2026-05-19",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY"
+    },
+    {
+      "ticker": "AMD",
+      "date": "2026-05-19",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY"
+    },
+    {
+      "ticker": "NFLX",
+      "date": "2026-05-19",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY"
+    },
+    {
+      "ticker": "PLTR",
+      "date": "2026-05-19",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY"
+    }
+  ]
+}

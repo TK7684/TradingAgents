@@ -1,21 +1,33 @@
 import os
+import logging
 from typing import Any, Optional
 
 from langchain_openai import ChatOpenAI
 
 from .base_client import BaseLLMClient, normalize_content
 from .validators import validate_model
+from .rate_limiter import get_rate_limiter
+
+log = logging.getLogger(__name__)
 
 
 class NormalizedChatOpenAI(ChatOpenAI):
-    """ChatOpenAI with normalized content output.
+    """ChatOpenAI with normalized content output and rate limiting.
 
     The Responses API returns content as a list of typed blocks
     (reasoning, text, etc.). This normalizes to string for consistent
-    downstream handling.
+    downstream handling. Also applies a global rate limiter to prevent
+    429 errors from the provider.
     """
 
     def invoke(self, input, config=None, **kwargs):
+        # Apply rate limiter before every invoke
+        try:
+            get_rate_limiter().acquire()
+        except TimeoutError as e:
+            log.error(f"Rate limiter timeout: {e}")
+            raise
+
         return normalize_content(super().invoke(input, config, **kwargs))
 
 # Kwargs forwarded from user config to ChatOpenAI

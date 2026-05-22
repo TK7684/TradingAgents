@@ -13,6 +13,7 @@ import json
 import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 # Load .env from project root
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -26,7 +27,11 @@ RESULTS_DIR = os.path.join(BASE_DIR, "results/daily")
 from config import get_config, WATCHLIST, ALL_WATCHLISTS
 from batch_analyze import analyze_ticker, get_latest_trading_date
 from discord_signal import send_trade_decision
-from paper_trader import execute_trade, load_portfolio, save_portfolio, get_portfolio_value
+from paper_trader import execute_trade, load_portfolio, save_portfolio, get_portfolio_value, check_risk_rules
+
+# Pipeline tuning
+INTER_TICKER_DELAY = 15  # Seconds between ticker analyses (was 3, too aggressive for Z.AI)
+TICKER_TIMEOUT = 600      # Hard timeout per ticker (10 min)
 
 
 def run_daily(tickers, profile="turbo"):
@@ -39,13 +44,58 @@ def run_daily(tickers, profile="turbo"):
     print(f"\n{'='*60}")
     print(f"  TradingAgents Daily Run")
     print(f"  Date: {date} | Profile: {profile} | Tickers: {len(tickers)}")
+    print(f"  Inter-ticker delay: {INTER_TICKER_DELAY}s | Timeout: {TICKER_TIMEOUT}s")
     print(f"{'='*60}\n")
 
+    # Step 0: Check risk rules on existing positions (stop-loss, take-profit, trailing stop)
+    print("Checking risk management rules (stop-loss, take-profit, trailing stop)...")
+    risk_trades = check_risk_rules(portfolio, date)
+    if risk_trades:
+        print(f"  {len(risk_trades)} risk rule(s) triggered")
+    else:
+        print("  No risk rules triggered")
+
+    # Step 1: Analyze each ticker sequentially with rate-limit-safe delays
     for i, ticker in enumerate(tickers, 1):
-        print(f"[{i}/{len(tickers)}] {ticker}...")
+        print(f"\n[{i}/{len(tickers)}] {ticker}...")
         start = time.time()
 
-        result = analyze_ticker(ticker, date, config)
+        # Run analysis with a hard timeout to prevent hung LLM calls from blocking
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(analyze_ticker, ticker, date, config)
+                result = future.result(timeout=TICKER_TIMEOUT)
+        except FuturesTimeoutError:
+            elapsed = time.time() - start
+            print(f"  TIMEOUT {ticker}: None ({elapsed:.0f}s) — LLM call exceeded {TICKER_TIMEOUT}s limit")
+            result = {
+                "ticker": ticker,
+                "date": date,
+                "decision": None,
+                "status": "error",
+                "error": f"Ticker analysis timed out after {TICKER_TIMEOUT} seconds",
+            }
+            results.append(result)
+            # Still delay after timeout to avoid burst on retry
+            if i < len(tickers):
+                print(f"  ...waiting {INTER_TICKER_DELAY}s before next ticker")
+                time.sleep(INTER_TICKER_DELAY)
+            continue
+        except Exception as e:
+            elapsed = time.time() - start
+            print(f"  ERROR {ticker}: {str(e)[:100]} ({elapsed:.0f}s)")
+            result = {
+                "ticker": ticker,
+                "date": date,
+                "decision": None,
+                "status": "error",
+                "error": str(e),
+            }
+            results.append(result)
+            if i < len(tickers):
+                time.sleep(INTER_TICKER_DELAY)
+            continue
+
         elapsed = time.time() - start
         decision = result.get("decision", "ERROR")
         status = result.get("status", "error")
@@ -53,14 +103,21 @@ def run_daily(tickers, profile="turbo"):
         icon = "OK" if status == "ok" else "FAIL"
         print(f"  {icon} {ticker}: {decision} ({elapsed:.0f}s)")
 
-        if status == "ok" and decision in ("BUY", "SELL", "HOLD"):
+        if status == "ok" and decision in ("BUY", "SELL", "HOLD", "OVERWEIGHT", "UNDERWEIGHT"):
+            # Normalize signals
+            trade_decision = decision
+            if decision == "OVERWEIGHT":
+                trade_decision = "BUY"
+            elif decision == "UNDERWEIGHT":
+                trade_decision = "SELL"
+
             # Post to Discord
             summary = result.get("summary", "")[:500]
             send_trade_decision(ticker, decision, summary)
 
             # Paper trade (only BUY/SELL)
-            if decision in ("BUY", "SELL"):
-                trade = execute_trade(portfolio, ticker, decision, date)
+            if trade_decision in ("BUY", "SELL"):
+                trade = execute_trade(portfolio, ticker, trade_decision, date)
                 if trade:
                     if trade["action"] == "BUY":
                         print(f"    -> BUY x{trade['shares']} @ ${trade['price']:.2f}")
@@ -70,9 +127,10 @@ def run_daily(tickers, profile="turbo"):
 
         results.append(result)
 
-        # Rate limit between tickers
+        # Rate limit between tickers — generous delay to stay under Z.AI quota
         if i < len(tickers):
-            time.sleep(3)
+            print(f"  ...waiting {INTER_TICKER_DELAY}s before next ticker (rate limit)")
+            time.sleep(INTER_TICKER_DELAY)
 
     # Save daily results
     os.makedirs(RESULTS_DIR, exist_ok=True)

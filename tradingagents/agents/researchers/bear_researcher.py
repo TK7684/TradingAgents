@@ -29,6 +29,8 @@ Key points to focus on:
 - Bull Counterpoints: Critically analyze the bull argument with specific data and sound reasoning, exposing weaknesses or over-optimistic assumptions.
 - Engagement: Present your argument in a conversational style, directly engaging with the bull analyst's points and debating effectively rather than simply listing facts.
 
+**If you believe the risks are significant enough, explicitly recommend SELL** — your job is not just to temper bullishness but to flag when a position should be exited.
+
 Resources available:
 
 Market research report: {market_research_report}

@@ -4,6 +4,12 @@
 Simulates a portfolio following BUY/SELL/HOLD signals.
 Tracks positions, P&L, and performance over time.
 
+Risk management features:
+- Stop-loss: -5% (hard exit)
+- Take-profit: +15% (lock in gains)
+- Trailing stop: 10% from peak (protect profits on runners)
+- Max drawdown: -10% portfolio-level circuit breaker
+
 Usage:
     python3.12 paper_trader.py                     # process latest decisions
     python3.12 paper_trader.py --status             # show portfolio status
@@ -25,7 +31,13 @@ PORTFOLIO_FILE = os.path.expanduser("~/TradingAgents/results/portfolio.json")
 TRADES_FILE = os.path.expanduser("~/TradingAgents/results/trades.json")
 
 INITIAL_CASH = 100000.0  # $100k paper money
-POSITION_SIZE = 0.10     # 10% of portfolio per position
+POSITION_SIZE = 0.20     # 20% of portfolio per position (max 5)
+MAX_POSITIONS = 5        # Maximum concurrent positions
+STOP_LOSS_PCT = -0.05    # -5% stop-loss per position
+TAKE_PROFIT_PCT = 0.15   # +15% take-profit per position
+TRAILING_STOP_PCT = 0.10 # 10% trailing stop from peak
+MAX_DRAWDOWN_PCT = -0.10 # -10% portfolio-level circuit breaker
+MIN_HOLD_DAYS = 1        # Don't sell within 1 day of buying (avoid churn)
 
 
 def load_portfolio():
@@ -37,6 +49,7 @@ def load_portfolio():
         "positions": {},
         "created": datetime.now(tz=timezone.utc).isoformat(),
         "total_trades": 0,
+        "peak_value": INITIAL_CASH,
     }
 
 
@@ -82,40 +95,152 @@ def execute_trade(portfolio, ticker, decision, date):
     position = portfolio["positions"].get(ticker)
     total_value = get_portfolio_value(portfolio)
 
+    # Map OVERWEIGHT -> BUY, UNDERWEIGHT -> SELL
+    if decision == "OVERWEIGHT":
+        decision = "BUY"
+    elif decision == "UNDERWEIGHT":
+        decision = "SELL"
+
     if decision == "BUY" and not position:
-        # Open new position — 10% of portfolio
+        # Enforce max positions limit
+        if len(portfolio["positions"]) >= MAX_POSITIONS:
+            print(f"  SKIP {ticker}: max positions ({MAX_POSITIONS}) reached")
+            return None
+
+        # Enforce 20% position size cap
         amount = total_value * POSITION_SIZE
         shares = int(amount / price)
-        if shares > 0 and portfolio["cash"] >= shares * price:
+        if shares <= 0:
+            print(f"  SKIP {ticker}: cannot afford even 1 share")
+            return None
+        cost = shares * price
+        if cost > total_value * POSITION_SIZE * 1.05:  # 5% tolerance for rounding
+            shares = int(total_value * POSITION_SIZE / price)
             cost = shares * price
-            portfolio["cash"] -= cost
-            portfolio["positions"][ticker] = {
-                "shares": shares, "avg_price": price,
-                "cost": cost, "date": date
-            }
-            trade = {"action": "BUY", "ticker": ticker, "shares": shares,
-                     "price": price, "cost": cost, "date": date}
-            portfolio["total_trades"] += 1
+        if portfolio["cash"] < cost:
+            print(f"  SKIP {ticker}: insufficient cash (${portfolio['cash']:.0f} < ${cost:.0f})")
+            return None
+
+        portfolio["cash"] -= cost
+        portfolio["positions"][ticker] = {
+            "shares": shares, "avg_price": price,
+            "cost": cost, "date": date,
+            "peak_price": price,  # Track peak for trailing stop
+        }
+        trade = {"action": "BUY", "ticker": ticker, "shares": shares,
+                 "price": price, "cost": cost, "date": date}
+        portfolio["total_trades"] += 1
 
     elif decision == "SELL" and position:
-        # Close position
-        shares = position["shares"]
-        revenue = shares * price
-        pnl = revenue - position["cost"]
-        pnl_pct = round(pnl / position["cost"] * 100, 2)
-        portfolio["cash"] += revenue
-        del portfolio["positions"][ticker]
-        trade = {"action": "SELL", "ticker": ticker, "shares": shares,
-                 "price": price, "revenue": revenue, "pnl": pnl,
-                 "pnl_pct": pnl_pct, "date": date}
-        portfolio["total_trades"] += 1
+        trade = _close_position(portfolio, trades, ticker, price, date, reason="SIGNAL")
 
     if trade:
         trades.append(trade)
         save_trades(trades)
+        # Update peak value tracking
+        new_value = get_portfolio_value(portfolio)
+        if new_value > portfolio.get("peak_value", INITIAL_CASH):
+            portfolio["peak_value"] = new_value
         save_portfolio(portfolio)
 
     return trade
+
+
+def _close_position(portfolio, trades, ticker, price, date, reason="SIGNAL"):
+    """Close a position and record the trade. Returns the trade dict."""
+    position = portfolio["positions"][ticker]
+    shares = position["shares"]
+    revenue = shares * price
+    pnl = revenue - position["cost"]
+    pnl_pct = round(pnl / position["cost"] * 100, 2)
+
+    portfolio["cash"] += revenue
+    del portfolio["positions"][ticker]
+    portfolio["total_trades"] += 1
+
+    trade = {
+        "action": "SELL", "ticker": ticker, "shares": shares,
+        "price": price, "revenue": revenue, "pnl": pnl,
+        "pnl_pct": pnl_pct, "date": date, "reason": reason,
+    }
+    trades.append(trade)
+
+    emoji = "⛔" if reason == "STOP_LOSS" else "🎯" if reason == "TAKE_PROFIT" else "📉" if reason == "TRAILING_STOP" else "💰"
+    print(f"  {emoji} {reason} {ticker}: SELL x{shares} @ ${price:.2f} (P&L: ${pnl:.0f}, {pnl_pct}%)")
+
+    return trade
+
+
+def check_risk_rules(portfolio, date=None):
+    """Check all risk management rules on existing positions.
+
+    Returns list of triggered trades (stop-loss, take-profit, trailing stop).
+    Also checks portfolio-level max drawdown circuit breaker.
+    """
+    if date is None:
+        date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+
+    trades = load_trades()
+    triggered = []
+
+    for ticker, pos in list(portfolio["positions"].items()):
+        price = get_current_price(ticker)
+        if not price:
+            continue
+
+        # Update peak price for trailing stop
+        if price > pos.get("peak_price", pos["avg_price"]):
+            pos["peak_price"] = price
+
+        # Calculate unrealized P&L percentage
+        pnl_pct = (price - pos["avg_price"]) / pos["avg_price"]
+
+        # 1. Hard stop-loss
+        if pnl_pct <= STOP_LOSS_PCT:
+            trade = _close_position(portfolio, trades, ticker, price, date, reason="STOP_LOSS")
+            triggered.append(trade)
+            continue
+
+        # 2. Take-profit
+        if pnl_pct >= TAKE_PROFIT_PCT:
+            trade = _close_position(portfolio, trades, ticker, price, date, reason="TAKE_PROFIT")
+            triggered.append(trade)
+            continue
+
+        # 3. Trailing stop (from peak, not entry)
+        peak = pos.get("peak_price", pos["avg_price"])
+        drawdown_from_peak = (price - peak) / peak
+        if drawdown_from_peak <= -TRAILING_STOP_PCT:
+            trade = _close_position(portfolio, trades, ticker, price, date, reason="TRAILING_STOP")
+            triggered.append(trade)
+            continue
+
+    # 4. Portfolio-level max drawdown circuit breaker
+    total_value = get_portfolio_value(portfolio)
+    peak = portfolio.get("peak_value", INITIAL_CASH)
+    if peak > 0:
+        portfolio_drawdown = (total_value - peak) / peak
+        if portfolio_drawdown <= MAX_DRAWDOWN_PCT:
+            print(f"  🚨 PORTFOLIO DRAWDOWN {portfolio_drawdown:.1%} — closing all positions!")
+            for ticker in list(portfolio["positions"].keys()):
+                price = get_current_price(ticker)
+                if price:
+                    trade = _close_position(portfolio, trades, ticker, price, date, reason="MAX_DRAWDOWN")
+                    triggered.append(trade)
+
+    if triggered:
+        save_trades(trades)
+        new_value = get_portfolio_value(portfolio)
+        if new_value > portfolio.get("peak_value", INITIAL_CASH):
+            portfolio["peak_value"] = new_value
+        save_portfolio(portfolio)
+
+    return triggered
+
+
+def check_stop_losses(portfolio, date=None):
+    """Backward-compatible alias for check_risk_rules."""
+    return check_risk_rules(portfolio, date)
 
 
 def get_portfolio_value(portfolio):
@@ -147,6 +272,14 @@ def process_decisions(json_path=None):
     portfolio = load_portfolio()
     executed = []
 
+    # Step 1: Check risk rules (stop-loss, take-profit, trailing stop) before processing new decisions
+    print("Checking risk management rules...")
+    risk_trades = check_risk_rules(portfolio)
+    if risk_trades:
+        print(f"  {len(risk_trades)} risk rule(s) triggered")
+        executed.extend(risk_trades)
+
+    # Step 2: Process analyst decisions
     for f in files:
         with open(f) as fh:
             data = json.load(fh)
@@ -166,9 +299,10 @@ def process_decisions(json_path=None):
                         ticker, trade["shares"], trade["price"], trade["cost"]))
                 else:
                     emoji = "+" if trade["pnl"] > 0 else ""
-                    print("  SELL {} x{} @ ${:.2f} (P&L: {}${:.0f}, {}%)".format(
+                    reason = f" ({trade.get('reason', '')})" if trade.get("reason") else ""
+                    print("  SELL {} x{} @ ${:.2f} (P&L: {}${:.0f}, {}%){}".format(
                         ticker, trade["shares"], trade["price"],
-                        emoji, trade["pnl"], trade["pnl_pct"]))
+                        emoji, trade["pnl"], trade["pnl_pct"], reason))
 
     if not executed:
         print("No trades executed (positions already aligned or HOLD)")
@@ -190,8 +324,9 @@ def process_decisions(json_path=None):
                     t["ticker"], t["shares"], t["price"]))
             else:
                 e = "\U0001f7e2" if t["pnl"] > 0 else "\U0001f534"
-                trade_lines.append("{} SELL {} P&L: ${:.0f} ({}%)".format(
-                    e, t["ticker"], t["pnl"], t["pnl_pct"]))
+                reason = f" ({t.get('reason', '')})" if t.get("reason") else ""
+                trade_lines.append("{} SELL {} P&L: ${:.0f} ({}%){}".format(
+                    e, t["ticker"], t["pnl"], t["pnl_pct"], reason))
 
         sign = "+" if pnl > 0 else ""
         payload = {"embeds": [{
@@ -221,17 +356,20 @@ def show_status(portfolio=None):
     print("Total Trades: {}".format(portfolio["total_trades"]))
 
     if portfolio["positions"]:
-        print("\n{:<8} {:<8} {:<10} {:<10} {}".format(
-            "Ticker", "Shares", "Avg Price", "Current", "P&L"))
-        print("-" * 50)
+        print("\n{:<8} {:<8} {:<10} {:<10} {:<6} {}".format(
+            "Ticker", "Shares", "Avg Price", "Current", "P&L%", "Trailing"))
+        print("-" * 60)
         for ticker, pos in sorted(portfolio["positions"].items()):
             price = get_current_price(ticker)
             if price:
                 pos_pnl = (price - pos["avg_price"]) * pos["shares"]
                 pos_pct = round((price - pos["avg_price"]) / pos["avg_price"] * 100, 1)
+                peak = pos.get("peak_price", pos["avg_price"])
+                trail = round((price - peak) / peak * 100, 1)
                 sign = "+" if pos_pnl > 0 else ""
-                print("{:<8} {:<8} ${:<9.2f} ${:<9.2f} {}${:.0f} ({}%)".format(
-                    ticker, pos["shares"], pos["avg_price"], price, sign, pos_pnl, pos_pct))
+                print("{:<8} {:<8} ${:<9.2f} ${:<9.2f} {}{:<5}% {}".format(
+                    ticker, pos["shares"], pos["avg_price"], price, sign, pos_pct,
+                    f"trail:{trail}%"))
     print()
 
 
@@ -241,6 +379,7 @@ def reset_portfolio():
         "positions": {},
         "created": datetime.now(tz=timezone.utc).isoformat(),
         "total_trades": 0,
+        "peak_value": INITIAL_CASH,
     }
     save_portfolio(portfolio)
     if os.path.exists(TRADES_FILE):

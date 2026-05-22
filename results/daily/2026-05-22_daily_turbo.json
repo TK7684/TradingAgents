@@ -1,0 +1,76 @@
+{
+  "date": "2026-05-22",
+  "profile": "turbo",
+  "results": [
+    {
+      "ticker": "NVDA",
+      "date": "2026-05-22",
+      "decision": null,
+      "status": "error",
+      "error": "Error code: 429 - {'error': {'code': '1302', 'message': '\u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387'}}"
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2026-05-22",
+      "decision": null,
+      "status": "error",
+      "error": "Error code: 429 - {'error': {'code': '1302', 'message': '\u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387'}}"
+    },
+    {
+      "ticker": "TSLA",
+      "date": "2026-05-22",
+      "decision": null,
+      "status": "error",
+      "error": "Error code: 429 - {'error': {'code': '1302', 'message': '\u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387'}}"
+    },
+    {
+      "ticker": "MSFT",
+      "date": "2026-05-22",
+      "decision": null,
+      "status": "error",
+      "error": "Error code: 429 - {'error': {'code': '1302', 'message': '\u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387'}}"
+    },
+    {
+      "ticker": "GOOGL",
+      "date": "2026-05-22",
+      "decision": null,
+      "status": "error",
+      "error": "Error code: 429 - {'error': {'code': '1302', 'message': '\u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387'}}"
+    },
+    {
+      "ticker": "AMZN",
+      "date": "2026-05-22",
+      "decision": null,
+      "status": "error",
+      "error": "Error code: 429 - {'error': {'code': '1302', 'message': '\u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387'}}"
+    },
+    {
+      "ticker": "META",
+      "date": "2026-05-22",
+      "decision": null,
+      "status": "error",
+      "error": "Error code: 429 - {'error': {'code': '1302', 'message': '\u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387'}}"
+    },
+    {
+      "ticker": "AMD",
+      "date": "2026-05-22",
+      "decision": null,
+      "status": "error",
+      "error": "Error code: 429 - {'error': {'code': '1302', 'message': '\u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387'}}"
+    },
+    {
+      "ticker": "NFLX",
+      "date": "2026-05-22",
+      "decision": null,
+      "status": "error",
+      "error": "Error code: 429 - {'error': {'code': '1302', 'message': '\u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387'}}"
+    },
+    {
+      "ticker": "PLTR",
+      "date": "2026-05-22",
+      "decision": null,
+      "status": "error",
+      "error": "Error code: 429 - {'error': {'code': '1302', 'message': '\u60a8\u7684\u8d26\u6237\u5df2\u8fbe\u5230\u901f\u7387\u9650\u5236\uff0c\u8bf7\u60a8\u63a7\u5236\u8bf7\u6c42\u9891\u7387'}}"
+    }
+  ]
+}

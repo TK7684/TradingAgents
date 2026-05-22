@@ -1,12 +1,6 @@
 {
-  "cash": 70342.73000000001,
+  "cash": 10859.950000000003,
   "positions": {
-    "NVDA": {
-      "shares": 42,
-      "avg_price": 235.74,
-      "cost": 9901.08,
-      "date": "2026-05-15"
-    },
     "AAPL": {
       "shares": 33,
       "avg_price": 298.21,
@@ -18,8 +12,51 @@
       "avg_price": 133.99,
       "cost": 9915.26,
       "date": "2026-05-15"
+    },
+    "AMZN": {
+      "shares": 37,
+      "avg_price": 264.14,
+      "cost": 9773.18,
+      "date": "2026-05-18"
+    },
+    "META": {
+      "shares": 16,
+      "avg_price": 614.23,
+      "cost": 9827.68,
+      "date": "2026-05-18"
+    },
+    "MSFT": {
+      "shares": 23,
+      "avg_price": 421.92,
+      "cost": 9704.16,
+      "date": "2026-05-18"
+    },
+    "TSLA": {
+      "shares": 24,
+      "avg_price": 409.99,
+      "cost": 9839.76,
+      "date": "2026-05-19"
+    },
+    "GOOGL": {
+      "shares": 25,
+      "avg_price": 396.94,
+      "cost": 9923.5,
+      "date": "2026-05-19"
+    },
+    "NFLX": {
+      "shares": 111,
+      "avg_price": 89.65,
+      "cost": 9951.150000000001,
+      "date": "2026-05-19"
+    },
+    "AMD": {
+      "shares": 23,
+      "avg_price": 420.99,
+      "cost": 9682.77,
+      "date": "2026-05-19"
     }
   },
   "created": "2026-04-18T03:01:25.921275+00:00",
-  "total_trades": 3
+  "total_trades": 10,
+  "peak_value": 100356.26999999999
 }

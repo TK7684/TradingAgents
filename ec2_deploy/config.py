@@ -12,6 +12,11 @@ def get_config(profile="default"):
     config["llm_provider"] = "openai"
     config["backend_url"] = ZAI_BASE_URL
 
+    # Rate-limit-safe settings for Z.AI
+    config["llm_timeout_seconds"] = 120      # 2min — Z.AI slow on complex prompts
+    config["llm_max_retries"] = 2            # LangChain retries for transient errors
+    config["llm_base_retry_delay"] = 4.0     # longer base delay
+
     if profile == "turbo":
         config["deep_think_llm"] = "glm-4.7"
         config["quick_think_llm"] = "glm-4.7"
