@@ -247,20 +247,16 @@ class TradingAgentsGraph:
         )
         args = self.propagator.get_graph_args()
 
-        if self.debug:
-            # Debug mode with tracing
-            trace = []
-            for chunk in self.graph.stream(init_agent_state, **args):
-                if len(chunk["messages"]) == 0:
-                    pass
-                else:
-                    chunk["messages"][-1].pretty_print()
-                    trace.append(chunk)
+        # Always use stream() — invoke() deadlocks with subgraphs on langgraph 1.1.8.
+        # stream() collects all node outputs; the last chunk is the final merged state.
+        final_state = None
+        for chunk in self.graph.stream(init_agent_state, **args):
+            final_state = chunk
+            if self.debug and chunk.get("messages"):
+                chunk["messages"][-1].pretty_print()
 
-            final_state = trace[-1]
-        else:
-            # Standard mode without tracing
-            final_state = self.graph.invoke(init_agent_state, **args)
+        if final_state is None:
+            raise RuntimeError("Graph stream produced no output")
 
         # Store current state for reflection
         self.curr_state = final_state

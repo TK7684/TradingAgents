@@ -89,5 +89,16 @@
     "pnl_pct": -6.88,
     "date": "2026-05-22",
     "reason": "STOP_LOSS"
+  },
+  {
+    "action": "SELL",
+    "ticker": "AMD",
+    "shares": 23,
+    "price": 503.89,
+    "revenue": 11589.47,
+    "pnl": 1906.699999999999,
+    "pnl_pct": 19.69,
+    "date": "2026-05-27",
+    "reason": "TAKE_PROFIT"
   }
 ]

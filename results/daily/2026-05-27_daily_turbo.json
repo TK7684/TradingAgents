@@ -1,0 +1,76 @@
+{
+  "date": "2026-05-27",
+  "profile": "turbo",
+  "results": [
+    {
+      "ticker": "NVDA",
+      "date": "2026-05-27",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY"
+    },
+    {
+      "ticker": "AAPL",
+      "date": "2026-05-27",
+      "decision": null,
+      "status": "error",
+      "error": "Ticker analysis timed out after 600 seconds"
+    },
+    {
+      "ticker": "TSLA",
+      "date": "2026-05-27",
+      "decision": null,
+      "status": "error",
+      "error": "Ticker analysis timed out after 600 seconds"
+    },
+    {
+      "ticker": "MSFT",
+      "date": "2026-05-27",
+      "decision": null,
+      "status": "error",
+      "error": "Request timed out."
+    },
+    {
+      "ticker": "GOOGL",
+      "date": "2026-05-27",
+      "decision": null,
+      "status": "error",
+      "error": "Ticker analysis timed out after 600 seconds"
+    },
+    {
+      "ticker": "AMZN",
+      "date": "2026-05-27",
+      "decision": null,
+      "status": "error",
+      "error": "Ticker analysis timed out after 600 seconds"
+    },
+    {
+      "ticker": "META",
+      "date": "2026-05-27",
+      "decision": null,
+      "status": "error",
+      "error": "Ticker analysis timed out after 600 seconds"
+    },
+    {
+      "ticker": "AMD",
+      "date": "2026-05-27",
+      "decision": null,
+      "status": "error",
+      "error": "Request timed out."
+    },
+    {
+      "ticker": "NFLX",
+      "date": "2026-05-27",
+      "decision": null,
+      "status": "error",
+      "error": "Ticker analysis timed out after 600 seconds"
+    },
+    {
+      "ticker": "PLTR",
+      "date": "2026-05-27",
+      "decision": null,
+      "status": "error",
+      "error": "Ticker analysis timed out after 600 seconds"
+    }
+  ]
+}

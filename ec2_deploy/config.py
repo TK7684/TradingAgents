@@ -18,8 +18,10 @@ def get_config(profile="default"):
     config["llm_base_retry_delay"] = 4.0     # longer base delay
 
     if profile == "turbo":
-        config["deep_think_llm"] = "glm-4.7"
-        config["quick_think_llm"] = "glm-4.7"
+        # glm-4.7 hangs on tool-calling (ReadTimeout on coding endpoint).
+        # glm-5.1 handles tools correctly (~6s/call).
+        config["deep_think_llm"] = "glm-5.1"
+        config["quick_think_llm"] = "glm-5.1"
         config["max_debate_rounds"] = 0
         config["max_risk_discuss_rounds"] = 0
     elif profile == "deep":
@@ -29,7 +31,7 @@ def get_config(profile="default"):
         config["max_risk_discuss_rounds"] = 2
     else:
         config["deep_think_llm"] = "glm-5.1"
-        config["quick_think_llm"] = "glm-4.7"
+        config["quick_think_llm"] = "glm-5.1"
         config["max_debate_rounds"] = 1
         config["max_risk_discuss_rounds"] = 1
 
