@@ -408,6 +408,39 @@ class AccuracyTracker:
             for row in rows
         }
 
+    def get_ticker_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Return accuracy statistics per ticker.
+
+        Returns:
+            ``{ticker: {"total": int, "correct": int, "accuracy": float,
+                       "buy_correct": int, "buy_total": int}}``
+        """
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT ticker, COUNT(*) as total, "
+            "SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) as correct, "
+            "ROUND(CAST(SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) AS REAL) "
+            "/ NULLIF(COUNT(*), 0), 4) as accuracy, "
+            "SUM(CASE WHEN predicted_signal = 'BUY' AND correct = 1 THEN 1 ELSE 0 END) as buy_correct, "
+            "SUM(CASE WHEN predicted_signal = 'BUY' THEN 1 ELSE 0 END) as buy_total, "
+            "SUM(CASE WHEN predicted_signal = 'SELL' AND correct = 1 THEN 1 ELSE 0 END) as sell_correct, "
+            "SUM(CASE WHEN predicted_signal = 'SELL' THEN 1 ELSE 0 END) as sell_total "
+            "FROM predictions WHERE actual_signal IS NOT NULL "
+            "GROUP BY ticker ORDER BY total DESC"
+        ).fetchall()
+        return {
+            row["ticker"]: {
+                "total": row["total"],
+                "correct": row["correct"],
+                "accuracy": row["accuracy"],
+                "buy_correct": row["buy_correct"],
+                "buy_total": row["buy_total"],
+                "sell_correct": row["sell_correct"],
+                "sell_total": row["sell_total"],
+            }
+            for row in rows
+        }
+
     def get_weights(self) -> Dict[str, float]:
         """Compute accuracy-weighted weights for each source.
 
@@ -625,6 +658,10 @@ class ConsensusEngine:
     def get_source_stats(self) -> Dict[str, Dict[str, Any]]:
         """Convenience wrapper around :class:`AccuracyTracker`."""
         return self.tracker.get_source_stats()
+
+    def get_ticker_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Convenience wrapper for per-ticker accuracy."""
+        return self.tracker.get_ticker_stats()
 
     def close(self) -> None:
         """Close the underlying SQLite connection."""

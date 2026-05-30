@@ -38,17 +38,19 @@ import yfinance as yf
 # Configuration
 # ---------------------------------------------------------------------------
 
-TRANSACTION_COST_PCT: float = 0.001     # 0.1% per trade (commission + slippage)
-SPREAD_PCT: float = 0.0005              # 0.05% bid-ask spread
+TRANSACTION_COST_PCT: float = 0.0005   # 0.05% per trade (~IBKR $0.005/share)
+SPREAD_PCT: float = 0.0001              # 0.01% bid-ask spread (liquid large caps)
 WINDOW_SIZE: int = 5                    # days of signals per walk-forward window
 STEP_SIZE: int = 1                      # days to step forward between windows
 INITIAL_CASH: float = 100_000.0
-POSITION_SIZE: float = 0.20             # 20% of portfolio per position
-MAX_POSITIONS: int = 5
+POSITION_SIZE: float = 0.10             # 10% of portfolio per position
+MAX_POSITIONS: int = 8
 STOP_LOSS_PCT: float = -0.05            # -5% hard stop-loss
 TAKE_PROFIT_PCT: float = 0.15           # +15% take-profit
 TRAILING_STOP_PCT: float = 0.10         # 10% trailing stop from peak
 RISK_FREE_RATE: float = 0.045           # annualized risk-free rate for Sharpe
+MAX_HOLD_DAYS: int = 10                 # forced exit after N trading days
+MIN_CONFIDENCE: float = 0.5             # minimum confidence to trade (if available)
 
 RESULTS_DIR: str = os.path.expanduser("~/TradingAgents/results/daily")
 OUTPUT_DIR: str = os.path.expanduser("~/TradingAgents/results/backtest")
@@ -130,6 +132,8 @@ class WalkForwardValidator:
         take_profit_pct: float = TAKE_PROFIT_PCT,
         trailing_stop_pct: float = TRAILING_STOP_PCT,
         risk_free_rate: float = RISK_FREE_RATE,
+        max_hold_days: int = MAX_HOLD_DAYS,
+        min_confidence: float = MIN_CONFIDENCE,
         results_dir: str = RESULTS_DIR,
     ) -> None:
         self.transaction_cost_pct = transaction_cost_pct
@@ -143,6 +147,8 @@ class WalkForwardValidator:
         self.take_profit_pct = take_profit_pct
         self.trailing_stop_pct = trailing_stop_pct
         self.risk_free_rate = risk_free_rate
+        self.max_hold_days = max_hold_days
+        self.min_confidence = min_confidence
         self.results_dir = results_dir
 
         # State populated by run_backtest()
@@ -156,6 +162,7 @@ class WalkForwardValidator:
         self.benchmark_curve: list[tuple[str, float]] = []
         self.signal_sources: dict[str, list[TradeRecord]] = {}  # source -> trades
         self._metrics: dict[str, Any] = {}
+        self._trading_days: list[str] = []  # ordered list of trading days seen
 
         # Price cache: ticker -> {date: price}
         self._price_cache: dict[str, dict[str, float]] = {}
@@ -336,16 +343,45 @@ class WalkForwardValidator:
         for date_str in sorted_dates:
             day_signals = by_date[date_str]
 
-            # Step 1: risk management on existing positions
+            # Track trading days for hold-period calculation
+            if date_str not in self._trading_days:
+                self._trading_days.append(date_str)
+
+            # Step 1: risk management on existing positions (incl. forced exit)
             self._check_risk_rules(date_str, price_data, result)
 
-            # Step 2: process new signals
+            # Step 2: sort signals by confidence (highest first) if available
+            day_signals = sorted(
+                day_signals,
+                key=lambda s: s.get("confidence", 0.0),
+                reverse=True,
+            )
+
+            # Step 3: process new signals
             for sig in day_signals:
                 ticker = sig["ticker"]
                 decision = self._normalize_decision(sig.get("decision", ""))
                 if decision is None:
+                    logger.debug(
+                        "SKIP %s on %s: decision='%s' → normalized to None",
+                        ticker, date_str, sig.get("decision"),
+                    )
                     continue
                 if sig.get("status") != "ok":
+                    logger.debug(
+                        "SKIP %s on %s: status='%s' (not ok)",
+                        ticker, date_str, sig.get("status"),
+                    )
+                    continue
+
+                # Confidence filtering: only trade if confidence >= threshold
+                # (confidence is optional — not all daily JSONs include it)
+                confidence = sig.get("confidence")
+                if confidence is not None and confidence < self.min_confidence:
+                    logger.info(
+                        "SKIP %s on %s: confidence=%.2f < min=%.2f",
+                        ticker, date_str, confidence, self.min_confidence,
+                    )
                     continue
 
                 price = self._get_price(ticker, date_str)
@@ -377,7 +413,8 @@ class WalkForwardValidator:
         price_data: dict[str, pd.Series],
         result: WindowResult,
     ) -> None:
-        """Apply stop-loss, take-profit, trailing stop to all open positions."""
+        """Apply stop-loss, take-profit, trailing stop, and forced hold-period exit."""
+        # Determine how many trading days have elapsed since entry for each position
         for ticker in list(self.positions.keys()):
             pos = self.positions[ticker]
             price = self._get_price(ticker, date_str)
@@ -402,6 +439,21 @@ class WalkForwardValidator:
                 if drawdown_from_peak <= -self.trailing_stop_pct:
                     reason = "TRAILING_STOP"
 
+            # Forced exit: if held for more than max_hold_days trading days, close
+            if reason is None and self.max_hold_days > 0:
+                days_held = 0
+                for td in self._trading_days:
+                    if td >= pos.entry_date:
+                        days_held += 1
+                    if td == date_str:
+                        break
+                if days_held > self.max_hold_days:
+                    reason = "MAX_HOLD_DAYS"
+                    logger.info(
+                        "FORCE EXIT %s on %s: held %d trading days (max=%d), pnl=%.1f%%",
+                        ticker, date_str, days_held, self.max_hold_days, pnl_pct * 100,
+                    )
+
             if reason:
                 self._close_position(ticker, price, date_str, reason, result)
 
@@ -415,9 +467,16 @@ class WalkForwardValidator:
     ) -> None:
         """Open a long position respecting position limits and costs."""
         if ticker in self.positions:
+            logger.debug(
+                "SKIP BUY %s on %s: already held (entry %s)",
+                ticker, date_str, self.positions[ticker].entry_date,
+            )
             return  # already held
         if len(self.positions) >= self.max_positions:
-            logger.info("SKIP %s: max positions (%d) reached", ticker, self.max_positions)
+            logger.info(
+                "SKIP BUY %s on %s: max positions (%d/%d) reached",
+                ticker, date_str, len(self.positions), self.max_positions,
+            )
             return
 
         total_value = self.cash + sum(
@@ -429,12 +488,19 @@ class WalkForwardValidator:
         available = self.cash - txn_cost
 
         if available < amount * 0.1:
-            logger.info("SKIP %s: insufficient cash after costs", ticker)
+            logger.info(
+                "SKIP BUY %s on %s: insufficient cash ($%.0f available < $%.0f needed * 10%%)",
+                ticker, date_str, available, amount,
+            )
             return
 
         effective_price = price * (1.0 + self.spread_pct / 2)
         shares = int(available / effective_price)
         if shares <= 0:
+            logger.info(
+                "SKIP BUY %s on %s: zero shares (price=$%.2f, available=$%.0f)",
+                ticker, date_str, effective_price, available,
+            )
             return
 
         cost = shares * effective_price
@@ -450,6 +516,11 @@ class WalkForwardValidator:
             avg_price=effective_price,
             cost=cost,
             entry_date=date_str,
+        )
+
+        logger.info(
+            "BUY %s on %s: %d shares @ $%.2f (cost=$%.0f, txn=$%.2f, cash=$%.0f)",
+            ticker, date_str, shares, effective_price, cost, txn_cost, self.cash,
         )
 
         trade = TradeRecord(
@@ -475,6 +546,7 @@ class WalkForwardValidator:
     ) -> None:
         """Close position on SELL signal."""
         if ticker not in self.positions:
+            logger.debug("SKIP SELL %s on %s: no position held", ticker, date_str)
             return
         self._close_position(ticker, price, date_str, "SIGNAL", result, sig)
 
@@ -498,6 +570,11 @@ class WalkForwardValidator:
 
         pnl = net_revenue - pos.cost
         pnl_pct = (pnl / pos.cost * 100) if pos.cost > 0 else 0.0
+
+        logger.info(
+            "SELL %s on %s: %d shares @ $%.2f, pnl=$%.0f (%.1f%%) [%s], cash=$%.0f",
+            ticker, date_str, pos.shares, effective_price, pnl, pnl_pct, reason, self.cash + net_revenue,
+        )
 
         self.cash += net_revenue
         del self.positions[ticker]
@@ -590,6 +667,7 @@ class WalkForwardValidator:
         self.daily_returns.clear()
         self.benchmark_curve.clear()
         self.signal_sources.clear()
+        self._trading_days.clear()
         self._price_cache.clear()
         self._metrics.clear()
 
@@ -821,6 +899,8 @@ class WalkForwardValidator:
         lines.append(f"| Stop-Loss | {self.stop_loss_pct*100:.1f}% |")
         lines.append(f"| Take-Profit | {self.take_profit_pct*100:.1f}% |")
         lines.append(f"| Trailing Stop | {self.trailing_stop_pct*100:.1f}% |")
+        lines.append(f"| Max Hold Days | {self.max_hold_days} |")
+        lines.append(f"| Min Confidence | {self.min_confidence} |")
         lines.append(f"| Window Size | {self.window_size} days |")
         lines.append(f"| Step Size | {self.step_size} days |")
         lines.append("")
@@ -1007,7 +1087,7 @@ def main() -> None:
     parser.add_argument("--start", type=str, help="Start date YYYY-MM-DD")
     parser.add_argument("--end", type=str, help="End date YYYY-MM-DD")
     parser.add_argument("--latest", type=int, metavar="N", help="Backtest last N days")
-    parser.add_argument("--benchmark", type=str, default=None, help="Benchmark ticker (e.g. SPY)")
+    parser.add_argument("--benchmark", type=str, default="SPY", help="Benchmark ticker (default: SPY)")
     parser.add_argument("--output", type=str, default=None, help="Output report path")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     args = parser.parse_args()

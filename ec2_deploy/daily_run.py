@@ -149,9 +149,19 @@ def run_daily(tickers, profile="turbo"):
             print(f"  ...waiting {INTER_TICKER_DELAY}s before next ticker (rate limit)")
             time.sleep(INTER_TICKER_DELAY)
 
-    # Save daily results
+    # Save daily results (include consensus data for backtest)
     os.makedirs(RESULTS_DIR, exist_ok=True)
     outfile = os.path.join(RESULTS_DIR, f"{date}_daily_{profile}.json")
+    # Strip consensus to serializable keys only
+    for r in results:
+        if "consensus" in r and isinstance(r["consensus"], dict):
+            r["consensus"] = {
+                "final_signal": r["consensus"].get("final_signal", ""),
+                "confidence": r["consensus"].get("confidence", 0),
+                "recommendation": r["consensus"].get("recommendation", ""),
+                "unanimous": r["consensus"].get("unanimous", False),
+                "source_signals": r["consensus"].get("source_signals", {}),
+            }
     with open(outfile, "w") as f:
         json.dump({"date": date, "profile": profile, "results": results}, f, indent=2)
 
