@@ -71,6 +71,16 @@ BUY_UNANIMITY_DISCOUNT: float = 0.15
 #: When investment_judge disagrees with execution block, this penalty applies to the majority.
 DISAGREEMENT_PENALTY: float = 0.25
 
+#: Additional BUY penalty when market regime is declining (SPY down >2% in 5 days).
+REGIME_DECLINE_BUY_PENALTY: float = 0.15
+
+#: Threshold for "declining market" regime (SPY 5-day return below this = declining).
+REGIME_DECLINE_THRESHOLD: float = -0.02
+
+#: Threshold for "strong decline" (extra penalty).
+REGIME_STRONG_DECLINE_THRESHOLD: float = -0.05
+REGIME_STRONG_DECLINE_PENALTY: float = 0.25
+
 #: Combined weight of the 3 execution sources (trader, risk_judge, PM) vs investment_judge.
 EXECUTION_BLOCK_WEIGHT: float = 0.40
 INVESTMENT_JUDGE_WEIGHT: float = 0.60
@@ -98,6 +108,26 @@ _RE_JUDGE_DECISION = re.compile(
     r"(?:\*\*)?Decision(?:\*\*)?\s*[:：]\s*(?:\*\*)?(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)(?:\*\*)?",
     re.IGNORECASE,
 )
+
+
+def get_market_regime() -> float:
+    """Return SPY 5-day return as a regime indicator.
+
+    Uses yfinance to fetch SPY close from 10 days ago and 5 days ago.
+    Returns the 5-day return fraction (e.g. -0.03 for -3% decline).
+    Returns 0.0 on any error (neutral regime).
+    """
+    try:
+        import yfinance as yf
+        spy = yf.Ticker("SPY")
+        hist = spy.history(period="10d", auto_adjust=True)
+        if hist is None or len(hist) < 6:
+            return 0.0
+        close_5d_ago = float(hist["Close"].iloc[-6])
+        close_now = float(hist["Close"].iloc[-1])
+        return (close_now - close_5d_ago) / close_5d_ago
+    except Exception:
+        return 0.0
 
 _RE_VERDICT = re.compile(
     r"(?:\*\*)?Verdict(?:\*\*)?\s*[:：]\s*(?:\*\*)?(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)(?:\*\*)?",
@@ -565,7 +595,20 @@ class ConfidenceScorer:
             # SELL won despite disagreement — mildly reward contrarian conviction
             buy_correction -= DISAGREEMENT_PENALTY * 0.25
 
-        confidence = max(0.0, min(1.0, round(consensus_level - buy_correction, 4)))
+        # --- Market regime correction ---
+        regime_ret = get_market_regime()
+        regime_correction = 0.0
+        if final_signal == "BUY" and regime_ret < REGIME_DECLINE_THRESHOLD:
+            if regime_ret < REGIME_STRONG_DECLINE_THRESHOLD:
+                regime_correction = REGIME_STRONG_DECLINE_PENALTY
+            else:
+                regime_correction = REGIME_DECLINE_BUY_PENALTY
+            log.info(
+                "Regime correction: SPY 5d return=%.2f%%, BUY penalty=%.2f",
+                regime_ret * 100, regime_correction,
+            )
+
+        confidence = max(0.0, min(1.0, round(consensus_level - buy_correction - regime_correction, 4)))
 
         recommendation = self._build_recommendation(final_signal, confidence, unanimous)
 
@@ -577,10 +620,10 @@ class ConfidenceScorer:
 
         log.info(
             "Consensus: signal=%s confidence=%.2f unanimous=%s recommendation=%s | "
-            "ij=%s exec=%s tiers_agree=%s buy_correction=%.2f | tally=%s",
+            "ij=%s exec=%s tiers_agree=%s buy_correction=%.2f regime=%.2f%% | tally=%s",
             final_signal, confidence, unanimous, recommendation,
             ij_signal, exec_signal, not tiers_disagree, buy_correction,
-            tally,
+            regime_ret * 100, tally,
         )
 
         return ConsensusResult(
