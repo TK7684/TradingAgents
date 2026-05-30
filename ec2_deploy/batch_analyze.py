@@ -54,7 +54,7 @@ def analyze_ticker(ticker, date, config=None, timeout_seconds=600):
                 config = DEFAULT_CONFIG.copy()
         
         ta = TradingAgentsGraph(debug=False, config=config)
-        _, decision = ta.propagate(ticker, date)
+        result_state, decision, consensus_data = ta.propagate(ticker, date)
         
         return {
             "ticker": ticker,
@@ -62,6 +62,7 @@ def analyze_ticker(ticker, date, config=None, timeout_seconds=600):
             "decision": decision.strip().upper() if decision else "UNKNOWN",
             "status": "ok",
             "summary": decision[:200] if decision else "",
+            "consensus": consensus_data,
         }
     except Exception as e:
         return {

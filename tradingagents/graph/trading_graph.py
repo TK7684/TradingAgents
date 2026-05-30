@@ -1,5 +1,6 @@
 # TradingAgents/graph/trading_graph.py
 
+import logging
 import os
 from pathlib import Path
 import json
@@ -7,6 +8,8 @@ from datetime import date
 from typing import Dict, Any, Tuple, List, Optional
 
 from langgraph.prebuilt import ToolNode
+
+log = logging.getLogger(__name__)
 
 from tradingagents.llm_clients import create_llm_client
 
@@ -42,6 +45,7 @@ from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
+from .consensus import ConsensusEngine
 
 
 class TradingAgentsGraph:
@@ -131,6 +135,7 @@ class TradingAgentsGraph:
         self.propagator = Propagator()
         self.reflector = Reflector(self.quick_thinking_llm)
         self.signal_processor = SignalProcessor(self.quick_thinking_llm)
+        self.consensus_engine = ConsensusEngine()
 
         # State tracking
         self.curr_state = None
@@ -265,7 +270,24 @@ class TradingAgentsGraph:
         self._log_state(trade_date, final_state)
 
         # Return decision and processed signal
-        return final_state, self.process_signal(final_state["final_trade_decision"])
+        signal = self.process_signal(final_state["final_trade_decision"])
+
+        # Run consensus voting across all 4 decision points
+        consensus_results = self.consensus_engine.evaluate(self.log_states_dict)
+        # Get the result for this trade_date
+        consensus = consensus_results.get(str(trade_date))
+        consensus_data = None
+        if consensus:
+            consensus_data = {
+                "confidence": consensus.confidence,
+                "recommendation": consensus.recommendation,
+                "source_signals": consensus.source_signals,
+                "unanimous": consensus.unanimous,
+            }
+            log.info("Consensus: %s (confidence=%.2f, unanimous=%s)",
+                     consensus.recommendation, consensus.confidence, consensus.unanimous)
+
+        return final_state, signal, consensus_data
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""

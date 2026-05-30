@@ -33,6 +33,9 @@ from paper_trader import execute_trade, load_portfolio, save_portfolio, get_port
 INTER_TICKER_DELAY = 15  # Seconds between ticker analyses (was 3, too aggressive for Z.AI)
 TICKER_TIMEOUT = 600      # Hard timeout per ticker (10 min)
 
+# Confidence thresholds for consensus voting
+MIN_CONFIDENCE_TO_TRADE = 0.5  # Don't paper-trade below this confidence
+
 
 def run_daily(tickers, profile="turbo"):
     """Run analysis on tickers, paper trade, and post signals."""
@@ -101,7 +104,9 @@ def run_daily(tickers, profile="turbo"):
         status = result.get("status", "error")
 
         icon = "OK" if status == "ok" else "FAIL"
-        print(f"  {icon} {ticker}: {decision} ({elapsed:.0f}s)")
+        confidence = result.get("consensus", {}).get("confidence", "N/A")
+        recommendation = result.get("consensus", {}).get("recommendation", "")
+        print(f"  {icon} {ticker}: {decision} (conf={confidence}) [{recommendation}] ({elapsed:.0f}s)")
 
         if status == "ok" and decision in ("BUY", "SELL", "HOLD", "OVERWEIGHT", "UNDERWEIGHT"):
             # Normalize signals
@@ -111,19 +116,31 @@ def run_daily(tickers, profile="turbo"):
             elif decision == "UNDERWEIGHT":
                 trade_decision = "SELL"
 
-            # Post to Discord
+            # Post to Discord (always post, even if low confidence — for tracking)
             summary = result.get("summary", "")[:500]
+            consensus_info = result.get("consensus")
+            if consensus_info:
+                summary += f"\n📊 Consensus: {consensus_info['recommendation']} (confidence={consensus_info['confidence']:.2f})"
+                if consensus_info.get("source_signals"):
+                    sources_str = " | ".join(
+                        f"{k}={v}" for k, v in consensus_info["source_signals"].items()
+                    )
+                    summary += f"\nSignals: {sources_str}"
             send_trade_decision(ticker, decision, summary)
 
-            # Paper trade (only BUY/SELL)
+            # Paper trade only when confidence meets threshold
+            consensus_confidence = (result.get("consensus") or {}).get("confidence", 1.0)
             if trade_decision in ("BUY", "SELL"):
-                trade = execute_trade(portfolio, ticker, trade_decision, date)
-                if trade:
-                    if trade["action"] == "BUY":
-                        print(f"    -> BUY x{trade['shares']} @ ${trade['price']:.2f}")
-                    else:
-                        pnl_s = "+" if trade["pnl"] > 0 else ""
-                        print(f"    -> SELL P&L: {pnl_s}${trade['pnl']:.0f} ({trade['pnl_pct']}%)")
+                if consensus_confidence >= MIN_CONFIDENCE_TO_TRADE:
+                    trade = execute_trade(portfolio, ticker, trade_decision, date)
+                    if trade:
+                        if trade["action"] == "BUY":
+                            print(f"    -> BUY x{trade['shares']} @ ${trade['price']:.2f}")
+                        else:
+                            pnl_s = "+" if trade["pnl"] > 0 else ""
+                            print(f"    -> SELL P&L: {pnl_s}${trade['pnl']:.0f} ({trade['pnl_pct']}%)")
+                else:
+                    print(f"    -> SKIP paper trade (confidence {consensus_confidence:.2f} < {MIN_CONFIDENCE_TO_TRADE})")
 
         results.append(result)
 
