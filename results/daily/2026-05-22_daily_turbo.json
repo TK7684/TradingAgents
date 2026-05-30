@@ -5,9 +5,21 @@
     {
       "ticker": "NVDA",
       "date": "2026-05-22",
-      "decision": "BUY",
+      "decision": "SELL",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "SELL",
+        "confidence": 0.6625,
+        "recommendation": "SELL",
+        "unanimous": false,
+        "source_signals": {
+          "investment_judge": "SELL",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     }
   ]
 }

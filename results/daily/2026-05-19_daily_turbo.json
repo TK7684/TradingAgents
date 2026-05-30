@@ -5,72 +5,192 @@
     {
       "ticker": "NVDA",
       "date": "2026-05-19",
-      "decision": "BUY",
+      "decision": "STRONG_BUY",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "BUY",
+        "confidence": 0.85,
+        "recommendation": "STRONG_BUY",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "BUY",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     },
     {
       "ticker": "AAPL",
       "date": "2026-05-19",
-      "decision": "HOLD",
+      "decision": "STRONG_HOLD",
       "status": "ok",
-      "summary": "HOLD"
+      "summary": "HOLD",
+      "consensus": {
+        "final_signal": "HOLD",
+        "confidence": 1.0,
+        "recommendation": "STRONG_HOLD",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "HOLD",
+          "trader": "HOLD",
+          "risk_judge": "HOLD",
+          "portfolio_manager": "HOLD"
+        }
+      }
     },
     {
       "ticker": "TSLA",
       "date": "2026-05-19",
-      "decision": "BUY",
+      "decision": "STRONG_BUY",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "BUY",
+        "confidence": 0.85,
+        "recommendation": "STRONG_BUY",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "BUY",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     },
     {
       "ticker": "MSFT",
       "date": "2026-05-19",
-      "decision": "BUY",
+      "decision": "STRONG_BUY",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "BUY",
+        "confidence": 0.85,
+        "recommendation": "STRONG_BUY",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "BUY",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     },
     {
       "ticker": "GOOGL",
       "date": "2026-05-19",
-      "decision": "BUY",
+      "decision": "STRONG_BUY",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "BUY",
+        "confidence": 0.85,
+        "recommendation": "STRONG_BUY",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "BUY",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     },
     {
       "ticker": "AMZN",
       "date": "2026-05-19",
-      "decision": "BUY",
+      "decision": "STRONG_BUY",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "BUY",
+        "confidence": 0.85,
+        "recommendation": "STRONG_BUY",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "BUY",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     },
     {
       "ticker": "META",
       "date": "2026-05-19",
-      "decision": "BUY",
+      "decision": "STRONG_BUY",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "BUY",
+        "confidence": 0.85,
+        "recommendation": "STRONG_BUY",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "BUY",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     },
     {
       "ticker": "AMD",
       "date": "2026-05-19",
-      "decision": "BUY",
+      "decision": "STRONG_BUY",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "BUY",
+        "confidence": 0.85,
+        "recommendation": "STRONG_BUY",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "BUY",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     },
     {
       "ticker": "NFLX",
       "date": "2026-05-19",
-      "decision": "BUY",
+      "decision": "STRONG_BUY",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "BUY",
+        "confidence": 0.85,
+        "recommendation": "STRONG_BUY",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "BUY",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     },
     {
       "ticker": "PLTR",
       "date": "2026-05-19",
-      "decision": "BUY",
+      "decision": "STRONG_BUY",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "BUY",
+        "confidence": 0.85,
+        "recommendation": "STRONG_BUY",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "BUY",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     }
   ]
 }

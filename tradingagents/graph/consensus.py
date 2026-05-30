@@ -64,6 +64,17 @@ CONFIDENCE_TRADE_THRESHOLD: float = 0.6
 #: Confidence + unanimity threshold for a STRONG signal.
 CONFIDENCE_STRONG_THRESHOLD: float = 0.85
 
+# Anti-BUY-bias correction
+#: When all sources agree on BUY, apply this discount to reflect base-rate overconfidence.
+BUY_UNANIMITY_DISCOUNT: float = 0.15
+
+#: When investment_judge disagrees with execution block, this penalty applies to the majority.
+DISAGREEMENT_PENALTY: float = 0.25
+
+#: Combined weight of the 3 execution sources (trader, risk_judge, PM) vs investment_judge.
+EXECUTION_BLOCK_WEIGHT: float = 0.40
+INVESTMENT_JUDGE_WEIGHT: float = 0.60
+
 # ---------------------------------------------------------------------------
 # Regex patterns (mirrors signal_processing.py)
 # ---------------------------------------------------------------------------
@@ -499,49 +510,84 @@ class ConfidenceScorer:
         source_signals: Dict[str, str],
         source_extractions: Optional[Dict[str, ExtractionResult]] = None,
     ) -> ConsensusResult:
-        """Score a set of per-source signals.
+        """Score a set of per-source signals with anti-bias corrections.
 
-        Args:
-            source_signals: ``{source: "BUY"|"HOLD"|"SELL"}`` (normalised).
-            source_extractions: Optional raw extraction details for logging.
+        Two voting tiers:
+        1. **Investment judge** (weight=0.60) — the analytical voice that sees
+           fundamentals.  Historically the most accurate source (30.4% vs 26.1%).
+        2. **Execution block** (trader+risk_judge+portfolio_manager, weight=0.40) —
+           the operational voices that tend to echo each other.  Their signal is
+           derived by majority vote within the block.
 
-        Returns:
-            A :class:`ConsensusResult` with final signal, confidence, and
-            recommendation.
+        Anti-BUY-bias corrections:
+        - BUY unanimity discount: if both tiers say BUY, confidence is reduced
+          because the system's base BUY rate is 80% (prior doesn't add information).
+        - Disagreement penalty: if tiers disagree, the majority signal loses
+          confidence (the minority voice has historically been valuable).
         """
-        weights = self._tracker.get_weights()
+        # --- Tiered voting ---
+        ij_signal = source_signals.get("investment_judge", "HOLD")
+        exec_signals = [
+            source_signals.get("trader", "HOLD"),
+            source_signals.get("risk_judge", "HOLD"),
+            source_signals.get("portfolio_manager", "HOLD"),
+        ]
+        # Majority vote within execution block
+        exec_tally: Dict[str, int] = {}
+        for s in exec_signals:
+            exec_tally[s] = exec_tally.get(s, 0) + 1
+        exec_signal = max(exec_tally, key=lambda k: (exec_tally[k], k))
 
-        # Weighted vote tally
+        # Weighted tally (2 tiers)
         tally: Dict[str, float] = {"BUY": 0.0, "HOLD": 0.0, "SELL": 0.0}
-        for src in SOURCES:
-            sig = source_signals.get(src, "HOLD")
-            w = weights.get(src, 0.0)
-            if sig in tally:
-                tally[sig] += w
+        tally[ij_signal] += INVESTMENT_JUDGE_WEIGHT
+        tally[exec_signal] += EXECUTION_BLOCK_WEIGHT
 
         final_signal = max(tally, key=lambda k: tally[k])
-        total_weight = sum(tally.values())
-        consensus_level = tally[final_signal] / total_weight if total_weight > 0 else 0.0
+        consensus_level = tally[final_signal]  # 0.0 – 1.0 since weights sum to 1.0
 
-        # Check unanimity (all extracted signals are the same)
+        # --- Unanimity check (original 4-source) ---
         signals_set = set(source_signals.get(src, "HOLD") for src in SOURCES)
         unanimous = len(signals_set) == 1
 
-        confidence = round(consensus_level, 4)
+        # --- Anti-BUY-bias corrections ---
+        tiers_disagree = (ij_signal != exec_signal)
+        buy_correction = 0.0
+
+        if final_signal == "BUY":
+            if unanimous:
+                # All 4 sources say BUY: discount because system is biased toward BUY
+                buy_correction += BUY_UNANIMITY_DISCOUNT
+            if tiers_disagree:
+                # Tiers disagree and BUY won by weight: penalise for ignoring the skeptic
+                buy_correction += DISAGREEMENT_PENALTY * 0.5
+        elif final_signal == "SELL" and tiers_disagree:
+            # SELL won despite disagreement — mildly reward contrarian conviction
+            buy_correction -= DISAGREEMENT_PENALTY * 0.25
+
+        confidence = max(0.0, min(1.0, round(consensus_level - buy_correction, 4)))
+
         recommendation = self._build_recommendation(final_signal, confidence, unanimous)
+
+        # Build display weights (show effective tier weights, not per-source)
+        display_weights = {
+            "investment_judge": INVESTMENT_JUDGE_WEIGHT,
+            "execution_block": EXECUTION_BLOCK_WEIGHT,
+        }
 
         log.info(
             "Consensus: signal=%s confidence=%.2f unanimous=%s recommendation=%s | "
-            "tally=%s weights=%s",
+            "ij=%s exec=%s tiers_agree=%s buy_correction=%.2f | tally=%s",
             final_signal, confidence, unanimous, recommendation,
-            tally, weights,
+            ij_signal, exec_signal, not tiers_disagree, buy_correction,
+            tally,
         )
 
         return ConsensusResult(
             final_signal=final_signal,
             confidence=confidence,
             source_signals=dict(source_signals),
-            weights=weights,
+            weights=display_weights,
             unanimous=unanimous,
             recommendation=recommendation,
             extractions=source_extractions or {},
@@ -551,16 +597,20 @@ class ConfidenceScorer:
     def _build_recommendation(signal: str, confidence: float, unanimous: bool) -> str:
         """Map signal + confidence to a human-readable recommendation.
 
-        Thresholds:
+        Thresholds (adjusted for anti-BUY-bias):
         * confidence >= 0.85 AND unanimous → STRONG_<signal>
         * confidence >= 0.6 → <signal> as-is
-        * confidence < 0.6 → HOLD (too uncertain)
+        * BUY with confidence 0.5-0.6 → CAUTIOUS_BUY (explicit low-conviction label)
+        * confidence < 0.5 → HOLD (too uncertain)
         """
         if confidence >= CONFIDENCE_STRONG_THRESHOLD and unanimous:
             return f"STRONG_{signal}"
 
         if confidence >= CONFIDENCE_TRADE_THRESHOLD:
             return signal
+
+        if signal == "BUY" and confidence >= 0.45:
+            return "CAUTIOUS_BUY"
 
         return "HOLD"
 

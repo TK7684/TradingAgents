@@ -5,9 +5,21 @@
     {
       "ticker": "PLTR",
       "date": "2026-05-15",
-      "decision": "BUY",
+      "decision": "STRONG_BUY",
       "status": "ok",
-      "summary": "BUY"
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "BUY",
+        "confidence": 0.85,
+        "recommendation": "STRONG_BUY",
+        "unanimous": true,
+        "source_signals": {
+          "investment_judge": "BUY",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
     }
   ]
 }

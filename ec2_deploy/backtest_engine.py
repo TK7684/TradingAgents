@@ -289,13 +289,35 @@ class WalkForwardValidator:
         return cost
 
     def _normalize_decision(self, decision: str) -> Optional[str]:
-        """Map decision string to BUY / SELL / None."""
+        """Map decision string to BUY / SELL / None.
+
+        Handles new consensus recommendations (STRONG_BUY, CAUTIOUS_BUY, etc.)
+        and legacy raw decisions (BUY, SELL, HOLD, OVERWEIGHT, UNDERWEIGHT).
+        """
         d = (decision or "").upper().strip()
-        if d in ("BUY", "OVERWEIGHT"):
+        if d in ("BUY", "OVERWEIGHT", "STRONG_BUY"):
             return "BUY"
-        if d in ("SELL", "UNDERWEIGHT"):
+        if d in ("SELL", "UNDERWEIGHT", "STRONG_SELL"):
             return "SELL"
+        # CAUTIOUS_BUY, HOLD, STRONG_HOLD → no trade
         return None
+
+    def _consensus_to_decision(self, recommendation: str) -> str:
+        """Map consensus recommendation to a backtest decision.
+
+        CAUTIOUS_BUY → HOLD (too uncertain to trade)
+        STRONG_HOLD/HOLD → no trade
+        STRONG_BUY/BUY → BUY
+        STRONG_SELL/SELL → SELL
+        """
+        if not recommendation:
+            return "HOLD"
+        rec = recommendation.upper()
+        if "BUY" in rec and "CAUTIOUS" not in rec:
+            return "BUY"
+        if "SELL" in rec:
+            return "SELL"
+        return "HOLD"
 
     # ------------------------------------------------------------------
     # Window simulation
@@ -483,19 +505,21 @@ class WalkForwardValidator:
             p.shares * (self._get_price(t, date_str) or p.cost)
             for t, p in self.positions.items()
         )
-        amount = total_value * self.position_size
-        txn_cost = self._apply_transaction_cost(amount)
+        target_amount = total_value * self.position_size
+        txn_cost = self._apply_transaction_cost(target_amount)
         available = self.cash - txn_cost
 
-        if available < amount * 0.1:
+        if available < target_amount * 0.1:
             logger.info(
                 "SKIP BUY %s on %s: insufficient cash ($%.0f available < $%.0f needed * 10%%)",
-                ticker, date_str, available, amount,
+                ticker, date_str, available, target_amount,
             )
             return
 
         effective_price = price * (1.0 + self.spread_pct / 2)
-        shares = int(available / effective_price)
+        # Cap purchase at target amount, not all available cash
+        invest_amount = min(available, target_amount)
+        shares = int(invest_amount / effective_price)
         if shares <= 0:
             logger.info(
                 "SKIP BUY %s on %s: zero shares (price=$%.2f, available=$%.0f)",
@@ -713,6 +737,12 @@ class WalkForwardValidator:
             for d in window_dates:
                 for r in daily_data[d].get("results", []):
                     r["date"] = r.get("date", d)
+                    # Use consensus recommendation if available, else fall back to decision
+                    consensus = r.get("consensus")
+                    if consensus and isinstance(consensus, dict):
+                        rec = consensus.get("recommendation", "")
+                        r["decision"] = self._consensus_to_decision(rec)
+                        r["confidence"] = consensus.get("confidence", r.get("confidence"))
                     window_signals.append(r)
 
             window_end = window_dates[-1]
