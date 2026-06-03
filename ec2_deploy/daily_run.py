@@ -50,6 +50,22 @@ def run_daily(tickers, profile="turbo"):
     print(f"  Inter-ticker delay: {INTER_TICKER_DELAY}s | Timeout: {TICKER_TIMEOUT}s")
     print(f"{'='*60}\n")
 
+    # Step 0: Fetch TradingView pre-market briefing ONCE for all tickers
+    tv_briefing = None
+    print("Fetching TradingView market data...")
+    try:
+        from tradingagents.tv_screener.client import TVScreener
+        from tradingagents.tv_screener.briefing import format_discord_briefing
+        tv = TVScreener()
+        # Build sectors dict from the tickers being analyzed
+        sectors = {"watchlist": tickers}
+        tv_briefing = tv.get_pre_market_watchlist(sectors=sectors)
+        # Print briefing summary to console
+        print(format_discord_briefing(tv_briefing))
+        print(f"  ✅ TradingView briefing loaded ({tv.has_realtime and 'real-time' or 'delayed'})\n")
+    except Exception as e:
+        print(f"  ⚠️  TradingView briefing failed (continuing without): {e}\n")
+
     # Step 0: Check risk rules on existing positions (stop-loss, take-profit, trailing stop)
     print("Checking risk management rules (stop-loss, take-profit, trailing stop)...")
     risk_trades = check_risk_rules(portfolio, date)
@@ -66,7 +82,7 @@ def run_daily(tickers, profile="turbo"):
         # Run analysis with a hard timeout to prevent hung LLM calls from blocking
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(analyze_ticker, ticker, date, config)
+                future = executor.submit(analyze_ticker, ticker, date, config, tv_briefing=tv_briefing)
                 result = future.result(timeout=TICKER_TIMEOUT)
         except FuturesTimeoutError:
             elapsed = time.time() - start

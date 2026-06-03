@@ -236,8 +236,14 @@ class TradingAgentsGraph:
             import logging
             logging.getLogger(__name__).error(f"Failed to load crypto trades: {e}")
 
-    def propagate(self, company_name, trade_date):
-        """Run the trading agents graph for a company on a specific date."""
+    def propagate(self, company_name, trade_date, market_context=""):
+        """Run the trading agents graph for a company on a specific date.
+
+        Args:
+            company_name: Ticker symbol or company name
+            trade_date: Analysis date string
+            market_context: Optional real-time market context text from TradingView
+        """
 
         self.ticker = company_name
 
@@ -246,9 +252,9 @@ class TradingAgentsGraph:
             self._load_crypto_trades()
             self._crypto_trades_loaded = True
 
-        # Initialize state
+        # Initialize state (with optional TradingView market context)
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date
+            company_name, trade_date, market_context=market_context
         )
         args = self.propagator.get_graph_args()
 

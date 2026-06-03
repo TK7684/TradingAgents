@@ -28,6 +28,8 @@ def create_portfolio_manager(llm, memory):
         for i, rec in enumerate(past_memories, 1):
             past_memory_str += rec["recommendation"] + "\n\n"
 
+        market_context = state.get("market_context", "")
+
         prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
 
 {instrument_context}
@@ -74,6 +76,8 @@ def create_portfolio_manager(llm, memory):
 {history}
 
 ---
+
+{market_context}
 
 Be decisive and ground every conclusion in specific evidence from the analysts. Do NOT default to Buy or Hold — if risk factors are present, favor Sell/Underweight to protect capital.{get_language_instruction()}"""
 

@@ -30,7 +30,7 @@ def get_latest_trading_date():
     return today.strftime("%Y-%m-%d")
 
 
-def analyze_ticker(ticker, date, config=None, timeout_seconds=600):
+def analyze_ticker(ticker, date, config=None, timeout_seconds=600, tv_briefing=None):
     """Analyze a single ticker using TradingAgents.
     
     Returns a dict with: ticker, date, decision, status, summary
@@ -41,6 +41,8 @@ def analyze_ticker(ticker, date, config=None, timeout_seconds=600):
         config: TradingAgents config dict
         timeout_seconds: Hard timeout per ticker (default 600s = 10min).
             Prevents hung LLM API calls from blocking the entire daily run.
+        tv_briefing: Optional TradingView briefing dict (from TVScreener).
+            If provided, market context is injected into the LLM analysis.
     """
     try:
         sys.path.insert(0, BASE_DIR)
@@ -59,7 +61,17 @@ def analyze_ticker(ticker, date, config=None, timeout_seconds=600):
                 config = DEFAULT_CONFIG.copy()
         
         ta = TradingAgentsGraph(debug=False, config=config)
-        result_state, decision, consensus_data = ta.propagate(ticker, date)
+
+        # Build TradingView market context for LLM enrichment
+        market_context = ""
+        if tv_briefing:
+            try:
+                from tradingagents.tv_screener.briefing import format_market_context_for_llm
+                market_context = format_market_context_for_llm(tv_briefing, ticker_symbol=ticker)
+            except Exception as e:
+                log.warning("Failed to format TradingView market context: %s", e)
+
+        result_state, decision, consensus_data = ta.propagate(ticker, date, market_context=market_context)
         
         return {
             "ticker": ticker,
@@ -80,7 +92,8 @@ def analyze_ticker(ticker, date, config=None, timeout_seconds=600):
 
 
 def analyze_ticker_with_retry(ticker, date, config=None, timeout_seconds=600,
-                               retry_enabled=True, max_retries=1, retry_delay=30):
+                               retry_enabled=True, max_retries=1, retry_delay=30,
+                               tv_briefing=None):
     """Analyze a ticker with retry logic for transient failures (e.g. LLM timeouts).
     
     On failure, waits retry_delay seconds before each retry attempt.
@@ -91,6 +104,7 @@ def analyze_ticker_with_retry(ticker, date, config=None, timeout_seconds=600,
         retry_enabled: if False, no retries are attempted
         max_retries: number of retries after the initial attempt (default 1)
         retry_delay: seconds to wait between attempts (default 30)
+        tv_briefing: Optional TradingView briefing dict (from TVScreener).
     """
     attempts = 1 + (max_retries if retry_enabled else 0)
     result = None
@@ -103,7 +117,7 @@ def analyze_ticker_with_retry(ticker, date, config=None, timeout_seconds=600,
             print(f"[RETRY] Attempt {attempt}/{attempts} for {ticker} after {retry_delay}s wait...")
             time.sleep(retry_delay)
         
-        result = analyze_ticker(ticker, date, config, timeout_seconds)
+        result = analyze_ticker(ticker, date, config, timeout_seconds, tv_briefing=tv_briefing)
         
         if result.get("status") == "ok":
             if attempt > 1:

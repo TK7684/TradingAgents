@@ -103,6 +103,121 @@ def format_discord_briefing(briefing: dict) -> str:
     return "\n".join(lines)
 
 
+def format_market_context_for_llm(briefing: dict, ticker_symbol: str = None) -> str:
+    """Format TradingView briefing data into a compact text section for LLM prompt injection.
+
+    Produces a concise market context block that gives the LLM real-time awareness
+    of market conditions, top movers, and per-ticker TradingView data.
+
+    Args:
+        briefing: Dict from TVScreener.get_pre_market_watchlist()
+        ticker_symbol: Optional ticker to highlight in context (e.g. "NVDA")
+
+    Returns:
+        Formatted string suitable for injection into LLM prompts.
+        Returns empty string if briefing is empty or malformed.
+    """
+    if not briefing:
+        return ""
+
+    lines = []
+    lines.append("=" * 60)
+    lines.append("REAL-TIME MARKET CONTEXT (TradingView Screener)")
+    lines.append("=" * 60)
+
+    # Market breadth
+    b = briefing.get("market_breadth", {})
+    if b and "error" not in b:
+        ratio = b.get("bull_bear_ratio", 0)
+        sentiment = "BULLISH" if ratio > 1.5 else ("BEARISH" if ratio < 0.8 else "NEUTRAL")
+        lines.append(f"\n📊 MARKET BREADTH: {sentiment} (Bull/Bear ratio: {ratio}x)")
+        lines.append(f"   Stocks scanned: {b.get('total_scanned', 'N/A')}")
+        lines.append(f"   Analysts — Bullish: {b.get('bullish', 'N/A')}, "
+                      f"Bearish: {b.get('bearish', 'N/A')}, Neutral: {b.get('neutral', 'N/A')}")
+        if b.get("avg_rsi") is not None:
+            lines.append(f"   Average RSI: {b['avg_rsi']}")
+        if b.get("avg_change") is not None:
+            lines.append(f"   Average change: {b['avg_change']:+.2f}%")
+        if b.get("gainers") is not None:
+            lines.append(f"   Gainers: {b['gainers']}, Losers: {b['losers']}")
+
+    # Top gainers
+    gainers = briefing.get("top_gainers", [])
+    if gainers:
+        lines.append("\n🚀 TOP GAINERS (>$10B cap, >+2%):")
+        for m in gainers[:8]:
+            lines.append(f"   {m['symbol']:<6} ${m['close']:>9,.2f}  {m['change_pct']:+.2f}%  "
+                         f"RSI:{m.get('rsi', 0):.1f}  {m['recommendation_label']}")
+
+    # Top losers
+    losers = briefing.get("top_losers", [])
+    if losers:
+        lines.append("\n📉 TOP LOSERS (>$10B cap, <-2%):")
+        for m in losers[:8]:
+            lines.append(f"   {m['symbol']:<6} ${m['close']:>9,.2f}  {m['change_pct']:+.2f}%  "
+                         f"RSI:{m.get('rsi', 0):.1f}  {m['recommendation_label']}")
+
+    # RSI extremes
+    oversold = briefing.get("oversold", [])
+    if oversold:
+        lines.append("\n🩸 OVERSOLD (RSI < 30):")
+        for m in oversold[:5]:
+            lines.append(f"   {m['symbol']:<6} RSI:{m.get('rsi', 0):.1f}  "
+                         f"${m['close']:,.2f}  {m['recommendation_label']}")
+
+    overbought = briefing.get("overbought", [])
+    if overbought:
+        lines.append("\n🌕 OVERBOUGHT (RSI > 70):")
+        for m in overbought[:5]:
+            lines.append(f"   {m['symbol']:<6} RSI:{m.get('rsi', 0):.1f}  "
+                         f"${m['close']:,.2f}  {m['recommendation_label']}")
+
+    # Volume breakouts
+    vol_breakouts = briefing.get("volume_breakouts", [])
+    if vol_breakouts:
+        lines.append("\n📢 VOLUME BREAKOUTS (>2x normal volume):")
+        for m in vol_breakouts[:5]:
+            rv = m.get("relative_volume_10d_calc", 0)
+            rv_str = f"{rv:.1f}x" if rv else "N/A"
+            lines.append(f"   {m['symbol']:<6} {m['change_pct']:+.2f}%  RelVol:{rv_str}  "
+                         f"{m.get('name', '')}")
+
+    # MACD crossovers
+    macd_bullish = briefing.get("macd_bullish", [])
+    if macd_bullish:
+        lines.append("\n✨ MACD BULLISH CROSSOVERS:")
+        for m in macd_bullish[:5]:
+            hist = m.get("MACD.histogram", 0)
+            lines.append(f"   {m['symbol']:<6} ${m['close']:,.2f}  "
+                         f"Hist:{hist:.4f}  {m['recommendation_label']}")
+
+    # Per-ticker enrichment data (highlight the analyzed ticker)
+    watchlist = briefing.get("watchlist_data", {})
+    if watchlist:
+        lines.append("\n📋 WATCHLIST TRADINGVIEW DATA:")
+        for sym, d in sorted(watchlist.items()):
+            close = d.get("close", 0) or 0
+            change = d.get("change", 0) or 0
+            rsi = d.get("RSI")
+            rec = d.get("Recommend.All", 0)
+            vol = d.get("volume", 0)
+            macd_hist = d.get("MACD.histogram")
+            rec_label = ("STRONG BUY" if rec > 0.8 else
+                         "BUY" if rec > 0.4 else
+                         "HOLD" if rec > -0.2 else
+                         "SELL" if rec > -0.6 else "STRONG SELL")
+            rsi_str = f"{rsi:.1f}" if rsi else "N/A"
+            macd_str = f"MACD_H:{macd_hist:.4f}" if macd_hist else ""
+            marker = " ◀ ANALYZING" if ticker_symbol and sym == ticker_symbol else ""
+            lines.append(f"   {sym:<7} ${close:>9,.2f} {change:>+6.2f}%  "
+                         f"RSI:{rsi_str:>6}  {rec_label:<11}  "
+                         f"Vol:{vol/1e6:.1f}M  {macd_str}{marker}")
+
+    lines.append("\n" + "=" * 60)
+
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="TradingView Pre-Market Briefing")
     parser.add_argument("--format", choices=["text", "json", "discord"], default="text")

@@ -70,3 +70,6 @@ class AgentState(MessagesState):
     # risk management team discussion step
     risk_debate_state: Annotated[RiskDebateState, _last_value]
     final_trade_decision: Annotated[str, _last_value]
+
+    # TradingView real-time market context (injected before analysis)
+    market_context: Annotated[str, _last_value]
