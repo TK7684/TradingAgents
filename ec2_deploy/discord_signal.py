@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 BOT_TOKEN = os.getenv("DISCORD_TOKEN", "")
-CHANNEL_ID = os.getenv("DISCORD_TRADE_CHANNEL", "")
+CHANNEL_ID = os.getenv("DISCORD_SIGNAL_THREAD", "") or os.getenv("DISCORD_TRADE_CHANNEL", "")
 
 
 def send_signal(embed_title, embed_description, color=0x5865F2):

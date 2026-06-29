@@ -1,5 +1,5 @@
 {
-  "cash": 22449.420000000002,
+  "cash": 83666.77999999998,
   "positions": {
     "AAPL": {
       "shares": 33,
@@ -7,58 +7,9 @@
       "cost": 9840.929999999998,
       "date": "2026-05-15",
       "peak_price": 308.33
-    },
-    "PLTR": {
-      "shares": 74,
-      "avg_price": 133.99,
-      "cost": 9915.26,
-      "date": "2026-05-15",
-      "peak_price": 136.6
-    },
-    "AMZN": {
-      "shares": 37,
-      "avg_price": 264.14,
-      "cost": 9773.18,
-      "date": "2026-05-18",
-      "peak_price": 265.29
-    },
-    "META": {
-      "shares": 16,
-      "avg_price": 614.23,
-      "cost": 9827.68,
-      "date": "2026-05-18",
-      "peak_price": 614.23
-    },
-    "MSFT": {
-      "shares": 23,
-      "avg_price": 421.92,
-      "cost": 9704.16,
-      "date": "2026-05-18",
-      "peak_price": 421.92
-    },
-    "TSLA": {
-      "shares": 24,
-      "avg_price": 409.99,
-      "cost": 9839.76,
-      "date": "2026-05-19",
-      "peak_price": 433.59
-    },
-    "GOOGL": {
-      "shares": 25,
-      "avg_price": 396.94,
-      "cost": 9923.5,
-      "date": "2026-05-19",
-      "peak_price": 396.94
-    },
-    "NFLX": {
-      "shares": 111,
-      "avg_price": 89.65,
-      "cost": 9951.150000000001,
-      "date": "2026-05-19",
-      "peak_price": 89.65
     }
   },
   "created": "2026-04-18T03:01:25.921275+00:00",
-  "total_trades": 11,
+  "total_trades": 20,
   "peak_value": 101775.21
 }

@@ -17,6 +17,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -85,9 +86,20 @@ REGIME_STRONG_DECLINE_PENALTY: float = 0.25
 EXECUTION_BLOCK_WEIGHT: float = 0.40
 INVESTMENT_JUDGE_WEIGHT: float = 0.60
 
+# DRL (Q-learning) constants
+# DRL_ALPHA: Blending factor: final_weight = (1-alpha)*accuracy_weight + alpha*drl_weight
+# DRL_LEARNING_RATE: How fast Q-values update on reward
+# DRL_DISCOUNT_FACTOR: Temporal discount for future rewards
+# DRL_DECAY_LAMBDA: Exponential decay lambda for old reward history (half-life ~10 entries)
+# DRL_MAX_WEIGHT_ADJUST: Clamp per-source adjustment to +/-this value
+DRL_ALPHA: float = 0.3
+DRL_LEARNING_RATE: float = 0.15
+DRL_DISCOUNT_FACTOR: float = 0.9
+DRL_DECAY_LAMBDA: float = 0.07
+DRL_MAX_WEIGHT_ADJUST: float = 0.15
+
 # ---------------------------------------------------------------------------
 # Regex patterns (mirrors signal_processing.py)
-# ---------------------------------------------------------------------------
 
 _RE_RATING = re.compile(
     r"(?:\*\*)?Rating(?:\*\*)?\s*[:：]\s*(?:\*\*)?(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)(?:\*\*)?",
@@ -308,6 +320,32 @@ class AccuracyTracker:
         );
     """
 
+    _DDL_DRL_REWARDS = """
+        CREATE TABLE IF NOT EXISTS drl_rewards (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker          TEXT    NOT NULL,
+            date            TEXT    NOT NULL,
+            source          TEXT    NOT NULL,
+            regime_bucket   TEXT    NOT NULL DEFAULT 'neutral',
+            streak_correct  INTEGER NOT NULL DEFAULT 0,
+            predicted_signal TEXT NOT NULL,
+            actual_signal   TEXT,
+            reward          REAL NOT NULL DEFAULT 0.0,
+            weight_adjust   REAL NOT NULL DEFAULT 0.0,
+            created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+    """
+
+    _DDL_DRL_QTABLE = """
+        CREATE TABLE IF NOT EXISTS drl_qtable (
+            regime_bucket   TEXT    NOT NULL,
+            source          TEXT    NOT NULL,
+            streak_bucket   INTEGER NOT NULL,
+            q_value         REAL    NOT NULL DEFAULT 0.0,
+            PRIMARY KEY (regime_bucket, source, streak_bucket)
+        );
+    """
+
     def __init__(self, db_path: Optional[str] = None):
         if db_path is None:
             db_path = os.path.expanduser(
@@ -330,7 +368,9 @@ class AccuracyTracker:
 
     def _ensure_tables(self) -> None:
         conn = self._get_conn()
-        conn.executescript(self._DDL_PREDICTIONS + self._DDL_STATS)
+        conn.executescript(
+            self._DDL_PREDICTIONS + self._DDL_STATS + self._DDL_DRL_REWARDS + self._DDL_DRL_QTABLE
+        )
         conn.commit()
 
     def close(self) -> None:
@@ -659,6 +699,328 @@ class ConfidenceScorer:
 
 
 # ---------------------------------------------------------------------------
+# DRL-Weighted Scorer (Q-learning style)
+# ---------------------------------------------------------------------------
+
+# Regime bucket boundaries for discretizing SPY 5-day return.
+_REGIME_BUCKETS: list = [
+    ("strong_decline", -1.0, REGIME_STRONG_DECLINE_THRESHOLD),
+    ("decline", REGIME_STRONG_DECLINE_THRESHOLD, REGIME_DECLINE_THRESHOLD),
+    ("neutral", REGIME_DECLINE_THRESHOLD, REGIME_DECLINE_THRESHOLD),  # special: catch zero
+    ("moderate_growth", REGIME_DECLINE_THRESHOLD, 0.03),
+    ("strong_growth", 0.03, 1.0),
+]
+
+# Streak bucket boundaries for discretizing last-5 correctness count.
+_STREAK_BUCKETS: list = [
+    (0, 0),    # 0/5 correct
+    (1, 1),    # 1/5 correct
+    (2, 2),    # 2/5 correct
+    (3, 3),    # 3/5 correct
+    (4, 5),    # 4-5/5 correct
+]
+
+
+def _discretize_regime(spy_return: float) -> str:
+    """Map a continuous SPY return to a discrete regime bucket string."""
+    if spy_return < REGIME_STRONG_DECLINE_THRESHOLD:
+        return "strong_decline"
+    if spy_return < REGIME_DECLINE_THRESHOLD:
+        return "decline"
+    if spy_return < 0.03:
+        return "neutral"
+    return "strong_growth"
+
+
+def _discretize_streak(correct_count: int) -> int:
+    """Map a correctness count (0-5) to a streak bucket index."""
+    correct_count = max(0, min(5, correct_count))
+    for lo, hi in _STREAK_BUCKETS:
+        if lo <= correct_count <= hi:
+            return lo
+    return 0
+
+
+class DRLWeightedScorer:
+    """Wrap :class:`ConfidenceScorer` with Q-learning based weight adjustment.
+
+    The scorer maintains a Q-table in SQLite keyed by
+    ``(regime_bucket, source, streak_bucket)`` and uses reward feedback
+    from consensus outcomes to learn per-source weight adjustments.
+
+    Final weights are an alpha-blend of accuracy-based and DRL-based weights::
+
+        final_weight = (1 - alpha) * accuracy_weight + alpha * drl_weight
+
+    This keeps the system safe: when there is no DRL history, it falls back
+    to pure accuracy weighting.  As reward history accumulates, the DRL
+    component gradually shifts weights toward what has worked recently in
+    the current market regime.
+    """
+
+    def __init__(
+        self,
+        accuracy_tracker: AccuracyTracker,
+        drl_alpha: float = DRL_ALPHA,
+        learning_rate: float = DRL_LEARNING_RATE,
+        discount_factor: float = DRL_DISCOUNT_FACTOR,
+        decay_lambda: float = DRL_DECAY_LAMBDA,
+        max_weight_adjust: float = DRL_MAX_WEIGHT_ADJUST,
+    ):
+        self._tracker = accuracy_tracker
+        self._base_scorer = ConfidenceScorer(accuracy_tracker)
+        self.drl_alpha = drl_alpha
+        self.learning_rate = learning_rate
+        self.discount_factor = discount_factor
+        self.decay_lambda = decay_lambda
+        self.max_weight_adjust = max_weight_adjust
+
+    # -- public interface ------------------------------------------------------
+
+    def score(
+        self,
+        source_signals: Dict[str, str],
+        source_extractions: Optional[Dict[str, ExtractionResult]] = None,
+        regime_return: Optional[float] = None,
+    ) -> ConsensusResult:
+        """Score signals, blending DRL-adjusted weights into the result.
+
+        If *regime_return* is None, calls :func:`get_market_regime` to fetch
+        the SPY 5-day return.  Pass an explicit value in tests or when
+        mocking market data.
+
+        Returns:
+            A :class:`ConsensusResult` whose ``weights`` dict contains the
+            DRL-blended per-source weights.
+        """
+        # Run the base scorer first (unchanged logic)
+        result = self._base_scorer.score(source_signals, source_extractions)
+
+        # Compute DRL-blended weights
+        drl_weights = self.get_blended_weights(
+            source_signals=source_signals,
+            regime_return=regime_return,
+        )
+
+        result.weights = drl_weights
+        return result
+
+    def get_blended_weights(
+        self,
+        source_signals: Dict[str, str],
+        regime_return: Optional[float] = None,
+    ) -> Dict[str, float]:
+        """Compute the alpha-blended per-source weights.
+
+        Args:
+            source_signals: Current source signals (used to determine which
+                sources voted with the consensus).
+            regime_return: SPY 5-day return.  Fetched live if None.
+
+        Returns:
+            Dict mapping each source name to its blended weight.
+        """
+        # Get accuracy-based weights
+        accuracy_weights = self._tracker.get_weights()
+
+        # Get DRL weight adjustments
+        if regime_return is None:
+            regime_return = get_market_regime()
+        regime_bucket = _discretize_regime(regime_return)
+
+        drl_adjustments = self._get_drl_weight_adjustments(regime_bucket, source_signals)
+
+        # Convert adjustments into raw DRL weights:
+        # Start from equal, apply adjustments, then normalise.
+        equal_weight = 1.0 / len(SOURCES)
+        raw_drl: Dict[str, float] = {}
+        for src in SOURCES:
+            raw_drl[src] = max(
+                MIN_WEIGHT,
+                equal_weight + drl_adjustments.get(src, 0.0),
+            )
+
+        # Normalise DRL weights to sum to 1
+        drl_total = sum(raw_drl.values())
+        if drl_total > 0:
+            drl_weights = {src: w / drl_total for src, w in raw_drl.items()}
+        else:
+            drl_weights = {src: equal_weight for src in SOURCES}
+
+        # Alpha blend
+        blended: Dict[str, float] = {}
+        for src in SOURCES:
+            aw = accuracy_weights.get(src, equal_weight)
+            dw = drl_weights.get(src, equal_weight)
+            blended[src] = round(
+                (1.0 - self.drl_alpha) * aw + self.drl_alpha * dw, 4
+            )
+
+        return blended
+
+    def record_reward(
+        self,
+        ticker: str,
+        date_str: str,
+        source_signals: Dict[str, str],
+        predicted_signal: str,
+        actual_signal: str,
+        regime_return: float = 0.0,
+    ) -> None:
+        """Record a reward for the DRL Q-table and update weights.
+
+        Reward: +1 for correct consensus, -1 for incorrect, 0 for HOLD outcomes.
+
+        Updates the ``drl_rewards`` table and then performs a Q-learning
+        update on the ``drl_qtable``.
+        """
+        predicted = predicted_signal.upper()
+        actual = actual_signal.upper()
+
+        # Compute reward
+        if predicted == actual:
+            reward = 1.0
+        elif predicted == "HOLD" or actual == "HOLD":
+            reward = 0.0
+        else:
+            reward = -1.0
+
+        regime_bucket = _discretize_regime(regime_return)
+
+        conn = self._tracker._get_conn()
+
+        # Get recent streak for each source (last 5 predictions)
+        for source in SOURCES:
+            streak = self._get_source_recent_correct(source, limit=5)
+            streak_bucket = _discretize_streak(streak)
+
+            # Fetch current Q-value
+            row = conn.execute(
+                "SELECT q_value FROM drl_qtable "
+                "WHERE regime_bucket = ? AND source = ? AND streak_bucket = ?",
+                (regime_bucket, source, streak_bucket),
+            ).fetchone()
+
+            old_q = row["q_value"] if row else 0.0
+
+            # Q-learning update: Q(s,a) = Q(s,a) + lr * (reward + gamma * max_Q(s',a') - Q(s,a))
+            # For simplicity, max_Q(s',a') is estimated as 0 (no next-state model)
+            new_q = old_q + self.learning_rate * (reward - old_q)
+
+            # Compute weight adjustment from Q-value, clamped
+            weight_adjust = max(
+                -self.max_weight_adjust,
+                min(self.max_weight_adjust, new_q * 0.05),
+            )
+
+            # Upsert Q-table
+            conn.execute(
+                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(regime_bucket, source, streak_bucket) "
+                "DO UPDATE SET q_value = excluded.q_value",
+                (regime_bucket, source, streak_bucket, new_q),
+            )
+
+            # Record reward history
+            conn.execute(
+                "INSERT INTO drl_rewards "
+                "(ticker, date, source, regime_bucket, streak_correct, "
+                "predicted_signal, actual_signal, reward, weight_adjust) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    ticker, date_str, source, regime_bucket, streak,
+                    predicted, actual, reward, weight_adjust,
+                ),
+            )
+
+        conn.commit()
+        log.debug(
+            "DRL reward recorded: ticker=%s date=%s reward=%.1f regime=%s",
+            ticker, date_str, reward, regime_bucket,
+        )
+
+    def get_reward_history(self, limit: int = 50) -> list:
+        """Return the most recent DRL reward records."""
+        conn = self._tracker._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM drl_rewards ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def decay_old_rewards(self) -> int:
+        """Apply exponential decay to all DRL Q-values.
+
+        Reduces each Q-value by ``exp(-decay_lambda)`` to make older
+        learned values less influential.  Called periodically to prevent
+        stale Q-values from dominating.
+
+        Returns:
+            Number of Q-table rows updated.
+        """
+        conn = self._tracker._get_conn()
+        decay_factor = math.exp(-self.decay_lambda)
+        cursor = conn.execute(
+            "UPDATE drl_qtable SET q_value = q_value * ? WHERE q_value != 0",
+            (decay_factor,),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+    def reset_qtable(self) -> None:
+        """Reset all Q-values to 0 (for testing)."""
+        conn = self._tracker._get_conn()
+        conn.execute("UPDATE drl_qtable SET q_value = 0.0")
+        conn.commit()
+
+    # -- private helpers ------------------------------------------------------
+
+    def _get_drl_weight_adjustments(
+        self,
+        regime_bucket: str,
+        source_signals: Dict[str, str],
+    ) -> Dict[str, float]:
+        """Look up the Q-table for current state and return weight adjustments."""
+        conn = self._tracker._get_conn()
+        adjustments: Dict[str, float] = {}
+
+        for source in SOURCES:
+            streak = self._get_source_recent_correct(source, limit=5)
+            streak_bucket = _discretize_streak(streak)
+
+            row = conn.execute(
+                "SELECT q_value FROM drl_qtable "
+                "WHERE regime_bucket = ? AND source = ? AND streak_bucket = ?",
+                (regime_bucket, source, streak_bucket),
+            ).fetchone()
+
+            if row:
+                # Convert Q-value to weight adjustment, clamped
+                adjustments[source] = max(
+                    -self.max_weight_adjust,
+                    min(self.max_weight_adjust, row["q_value"] * 0.05),
+                )
+            else:
+                adjustments[source] = 0.0
+
+        return adjustments
+
+    def _get_source_recent_correct(self, source: str, limit: int = 5) -> int:
+        """Count how many of the last *limit* predictions for *source* were correct."""
+        conn = self._tracker._get_conn()
+        row = conn.execute(
+            "SELECT SUM(correct) as cnt FROM ("
+            "  SELECT correct FROM predictions "
+            "  WHERE source = ? AND actual_signal IS NOT NULL "
+            "  ORDER BY id DESC LIMIT ?"
+            ")",
+            (source, limit),
+        ).fetchone()
+        return int(row["cnt"] or 0)
+
+
+# ---------------------------------------------------------------------------
 # Top-level Engine
 # ---------------------------------------------------------------------------
 
@@ -672,14 +1034,16 @@ class ConsensusEngine:
         print(result.recommendation)
     """
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, drl_alpha: float = DRL_ALPHA):
         self.extractor = ConsensusSignalExtractor()
         self.tracker = AccuracyTracker(db_path=db_path)
         self.scorer = ConfidenceScorer(self.tracker)
+        self.drl_scorer = DRLWeightedScorer(self.tracker, drl_alpha=drl_alpha)
 
     def evaluate(
         self,
         log_states_dict: Dict[str, Dict[str, Any]],
+        use_drl: bool = True,
     ) -> Dict[str, ConsensusResult]:
         """Run consensus evaluation over all dates in *log_states_dict*.
 
@@ -687,19 +1051,23 @@ class ConsensusEngine:
             log_states_dict: The dict produced by
                 :meth:`TradingAgentsGraph._log_state`, mapping
                 ``str(trade_date)`` → state dict.
+            use_drl: If True (default), use the DRL-weighted scorer which
+                blends accuracy-based weights with Q-learned adjustments.
+                Set to False to use the original scorer unchanged.
 
         Returns:
             Mapping of ``date_str`` → :class:`ConsensusResult`.
             Each result's extractions are populated with full detail.
         """
         results: Dict[str, ConsensusResult] = {}
+        scorer = self.drl_scorer if use_drl else self.scorer
 
         for date_str, state in log_states_dict.items():
             try:
                 extractions = self.extractor.extract_from_state(state)
                 source_signals = {src: ext.signal for src, ext in extractions.items()}
 
-                result = self.scorer.score(source_signals, extractions)
+                result = scorer.score(source_signals, extractions)
                 results[date_str] = result
 
                 # Persist predictions for future accuracy tracking
@@ -747,6 +1115,45 @@ class ConsensusEngine:
             Number of prediction rows updated.
         """
         return self.tracker.record_outcome(ticker, date_str, actual_signal)
+
+    def record_drl_reward(
+        self,
+        ticker: str,
+        date_str: str,
+        predicted_signal: str,
+        actual_signal: str,
+        regime_return: float = 0.0,
+    ) -> None:
+        """Record a DRL reward for a consensus outcome.
+
+        Convenience wrapper around :meth:`DRLWeightedScorer.record_reward`.
+        """
+        # Reconstruct approximate source signals from the predictions table
+        source_signals: Dict[str, str] = {}
+        conn = self.tracker._get_conn()
+        rows = conn.execute(
+            "SELECT source, predicted_signal FROM predictions "
+            "WHERE ticker = ? AND date = ?",
+            (ticker, date_str),
+        ).fetchall()
+        for row in rows:
+            source_signals[row["source"]] = row["predicted_signal"]
+
+        if not source_signals:
+            source_signals = {src: "HOLD" for src in SOURCES}
+
+        self.drl_scorer.record_reward(
+            ticker=ticker,
+            date_str=date_str,
+            source_signals=source_signals,
+            predicted_signal=predicted_signal,
+            actual_signal=actual_signal,
+            regime_return=regime_return,
+        )
+
+    def get_drl_reward_history(self, limit: int = 50) -> list:
+        """Return recent DRL reward records."""
+        return self.drl_scorer.get_reward_history(limit=limit)
 
     def get_source_stats(self) -> Dict[str, Dict[str, Any]]:
         """Convenience wrapper around :class:`AccuracyTracker`."""

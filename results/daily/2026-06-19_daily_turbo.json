@@ -1,0 +1,25 @@
+{
+  "date": "2026-06-19",
+  "profile": "turbo",
+  "results": [
+    {
+      "ticker": "NVDA",
+      "date": "2026-06-19",
+      "decision": "BUY",
+      "status": "ok",
+      "summary": "BUY",
+      "consensus": {
+        "final_signal": "",
+        "confidence": 0.6625,
+        "recommendation": "SELL",
+        "unanimous": false,
+        "source_signals": {
+          "investment_judge": "SELL",
+          "trader": "BUY",
+          "risk_judge": "BUY",
+          "portfolio_manager": "BUY"
+        }
+      }
+    }
+  ]
+}

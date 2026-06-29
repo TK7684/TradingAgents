@@ -100,5 +100,101 @@
     "pnl_pct": 19.69,
     "date": "2026-05-27",
     "reason": "TAKE_PROFIT"
+  },
+  {
+    "action": "SELL",
+    "ticker": "AMZN",
+    "shares": 37,
+    "price": 246.03,
+    "revenue": 9103.11,
+    "pnl": -670.0699999999997,
+    "pnl_pct": -6.86,
+    "date": "2026-06-05",
+    "reason": "STOP_LOSS"
+  },
+  {
+    "action": "SELL",
+    "ticker": "GOOGL",
+    "shares": 25,
+    "price": 368.53,
+    "revenue": 9213.25,
+    "pnl": -710.25,
+    "pnl_pct": -7.16,
+    "date": "2026-06-05",
+    "reason": "STOP_LOSS"
+  },
+  {
+    "action": "SELL",
+    "ticker": "NFLX",
+    "shares": 111,
+    "price": 82.18,
+    "revenue": 9121.980000000001,
+    "pnl": -829.1700000000001,
+    "pnl_pct": -8.33,
+    "date": "2026-06-05",
+    "reason": "STOP_LOSS"
+  },
+  {
+    "action": "SELL",
+    "ticker": "META",
+    "shares": 16,
+    "price": 577.22,
+    "revenue": 9235.52,
+    "pnl": -592.1599999999999,
+    "pnl_pct": -6.03,
+    "date": "2026-06-19",
+    "reason": "STOP_LOSS"
+  },
+  {
+    "action": "SELL",
+    "ticker": "MSFT",
+    "shares": 23,
+    "price": 379.4,
+    "revenue": 8726.199999999999,
+    "pnl": -977.960000000001,
+    "pnl_pct": -10.08,
+    "date": "2026-06-19",
+    "reason": "STOP_LOSS"
+  },
+  {
+    "action": "BUY",
+    "ticker": "NVDA",
+    "shares": 91,
+    "price": 210.69,
+    "cost": 19172.79,
+    "date": "2026-06-19"
+  },
+  {
+    "action": "SELL",
+    "ticker": "PLTR",
+    "shares": 74,
+    "price": 112.93,
+    "revenue": 8356.82,
+    "pnl": -1558.4400000000005,
+    "pnl_pct": -15.72,
+    "date": "2026-06-29",
+    "reason": "STOP_LOSS"
+  },
+  {
+    "action": "SELL",
+    "ticker": "TSLA",
+    "shares": 24,
+    "price": 379.71,
+    "revenue": 9113.039999999999,
+    "pnl": -726.7200000000012,
+    "pnl_pct": -7.39,
+    "date": "2026-06-29",
+    "reason": "STOP_LOSS"
+  },
+  {
+    "action": "SELL",
+    "ticker": "NVDA",
+    "shares": 91,
+    "price": 192.53,
+    "revenue": 17520.23,
+    "pnl": -1652.5600000000013,
+    "pnl_pct": -8.62,
+    "date": "2026-06-29",
+    "reason": "STOP_LOSS"
   }
 ]

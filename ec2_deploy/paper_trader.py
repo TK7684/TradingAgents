@@ -102,20 +102,56 @@ def execute_trade(portfolio, ticker, decision, date):
         decision = "SELL"
 
     if decision == "BUY" and not position:
+        # ── Signal accuracy filter ────────────────────────────────────
+        try:
+            sys.path.insert(0, os.path.expanduser("~/TradingAgents"))
+            from signal_filter import SignalFilter
+            sf = SignalFilter()
+            allowed, reason = sf.should_trade(ticker, "BUY")
+            if not allowed:
+                print(f"  BLOCKED {ticker}: {reason}")
+                return None
+            if reason.startswith("WARN"):
+                print(f"  ⚠️  {reason}")
+        except Exception as e:
+            print(f"  ⚠️  Signal filter error (continuing): {e}")
+
+        # ── Market regime check ──────────────────────────────────────
+        try:
+            from signal_filter import check_market_regime
+            regime = check_market_regime()
+            if not regime["allow_buys"]:
+                print(f"  BLOCKED {ticker}: market regime = {regime['regime']} — {regime['reason']}")
+                return None
+        except Exception as e:
+            print(f"  ⚠️  Market regime check error (continuing): {e}")
+
+        # ── Position weight from signal accuracy ──────────────────────
+        position_weight = 1.0
+        try:
+            from signal_filter import SignalFilter
+            sf = SignalFilter()
+            position_weight = sf.get_position_weight(ticker)
+            if position_weight < 1.0:
+                print(f"  📉 Position weight: {position_weight:.2f} (reduced due to accuracy)")
+        except Exception:
+            pass
+
         # Enforce max positions limit
         if len(portfolio["positions"]) >= MAX_POSITIONS:
             print(f"  SKIP {ticker}: max positions ({MAX_POSITIONS}) reached")
             return None
 
-        # Enforce 20% position size cap
-        amount = total_value * POSITION_SIZE
+        # Enforce position size cap (adjusted by accuracy weight)
+        effective_size = POSITION_SIZE * position_weight
+        amount = total_value * effective_size
         shares = int(amount / price)
         if shares <= 0:
             print(f"  SKIP {ticker}: cannot afford even 1 share")
             return None
         cost = shares * price
-        if cost > total_value * POSITION_SIZE * 1.05:  # 5% tolerance for rounding
-            shares = int(total_value * POSITION_SIZE / price)
+        if cost > total_value * effective_size * 1.05:  # 5% tolerance for rounding
+            shares = int(total_value * effective_size / price)
             cost = shares * price
         if portfolio["cash"] < cost:
             print(f"  SKIP {ticker}: insufficient cash (${portfolio['cash']:.0f} < ${cost:.0f})")
