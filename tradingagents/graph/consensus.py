@@ -903,9 +903,23 @@ class DRLWeightedScorer:
 
             old_q = row["q_value"] if row else 0.0
 
-            # Q-learning update: Q(s,a) = Q(s,a) + lr * (reward + gamma * max_Q(s',a') - Q(s,a))
-            # For simplicity, max_Q(s',a') is estimated as 0 (no next-state model)
-            new_q = old_q + self.learning_rate * (reward - old_q)
+            # Q-learning (TD) update: Q(s,a) <- Q(s,a) + lr * (r + gamma * max_Q(s',a') - Q(s,a))
+            # Bootstrap the next-state value as the best Q across streak
+            # buckets for the same (regime, source) -- a proxy for the best
+            # attainable future value of this source in the current regime.
+            next_max_row = conn.execute(
+                "SELECT MAX(q_value) FROM drl_qtable "
+                "WHERE regime_bucket = ? AND source = ?",
+                (regime_bucket, source),
+            ).fetchone()
+            max_next_q = (
+                next_max_row[0]
+                if next_max_row and next_max_row[0] is not None
+                else 0.0
+            )
+            new_q = old_q + self.learning_rate * (
+                reward + self.discount_factor * max_next_q - old_q
+            )
 
             # Compute weight adjustment from Q-value, clamped
             weight_adjust = max(
