@@ -21,6 +21,7 @@ from tradingagents.graph.consensus import (
     _discretize_streak,
     DRL_ALPHA,
     DRL_LEARNING_RATE,
+    DRL_DISCOUNT_FACTOR,
     DRL_DECAY_LAMBDA,
     DRL_MAX_WEIGHT_ADJUST,
     MIN_WEIGHT,
@@ -415,3 +416,47 @@ class TestEdgeCases:
         conn = drl_scorer._tracker._get_conn()
         rows = conn.execute("SELECT q_value FROM drl_qtable").fetchall()
         assert all(r["q_value"] == 0.0 for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# TD-bootstrap (discount factor application)
+# ---------------------------------------------------------------------------
+
+class TestTDBootstrap:
+    def test_td_bootstrap_applies_discount_factor(self, drl_scorer):
+        """TD-bootstrap: an existing Q-value in a sibling streak bucket must
+        raise the next-state estimate, so a correct reward produces a higher
+        Q-value than the pure bandit update (lr * reward).
+
+        This verifies the previously-degenerate update (max_Q(s',a') = 0)
+        now applies DRL_DISCOUNT_FACTOR.
+        """
+        conn = drl_scorer._tracker._get_conn()
+        regime = "neutral"
+        source = "investment_judge"
+        # Seed a known Q-value in a sibling streak bucket for the same
+        # (regime, source) so the next-state MAX has something to bootstrap.
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+            "VALUES (?, ?, ?, ?)",
+            (regime, source, 2, 0.5),
+        )
+        conn.commit()
+
+        signals = {source: "BUY"}
+        drl_scorer.record_reward(
+            ticker="AAPL", date_str="2026-06-10",
+            source_signals=signals, predicted_signal="BUY", actual_signal="BUY",
+            regime_return=0.0,  # neutral regime
+        )
+
+        bandit_q = DRL_LEARNING_RATE * 1.0  # what the old degenerate update gave
+        row = conn.execute(
+            "SELECT q_value FROM drl_qtable "
+            "WHERE regime_bucket=? AND source=? AND streak_bucket=0",
+            (regime, source),
+        ).fetchone()
+        td_q = row["q_value"]
+        expected_td = DRL_LEARNING_RATE * (1.0 + DRL_DISCOUNT_FACTOR * 0.5)
+        assert abs(td_q - expected_td) < 1e-6
+        assert td_q > bandit_q  # bootstrap boosts beyond the bandit baseline
