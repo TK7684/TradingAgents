@@ -34,7 +34,7 @@ def get_language_instruction() -> str:
     return f" Write your entire response in {lang}."
 
 
-def build_instrument_context(ticker: str) -> str:
+def build_instrument_context(ticker: str, asset_type: str = "stock") -> str:
     """Describe the exact instrument so agents preserve exchange-qualified tickers."""
     return (
         f"The instrument to analyze is `{ticker}`. "
@@ -42,6 +42,20 @@ def build_instrument_context(ticker: str) -> str:
         "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`) "
         "or crypto quote pair (e.g. `BTC-USD`, `ETH-USD`)."
     )
+
+
+def get_instrument_context_from_state(state) -> str:
+    """Return the instrument context for the current run.
+
+    Adapter for v0.3.x agents: prefers state-cached context, falls back
+    to build_instrument_context using company_of_interest from state.
+    """
+    context = state.get("instrument_context") if isinstance(state, dict) else None
+    if isinstance(context, str) and context.strip():
+        return context
+    company = str(state.get("company_of_interest", "")) if isinstance(state, dict) else ""
+    return build_instrument_context(company)
+
 
 def create_msg_delete():
     def delete_messages(state):

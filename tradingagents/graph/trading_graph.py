@@ -109,6 +109,10 @@ class TradingAgentsGraph:
         self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config)
         self.portfolio_manager_memory = FinancialSituationMemory("portfolio_manager_memory", self.config)
 
+        # Append-only decision log (v0.3.x) — provides past_context for PM
+        from tradingagents.agents.utils.memory import TradingMemoryLog
+        self.memory_log = TradingMemoryLog(self.config)
+
         # Lazy-load crypto trade history flag
         self._crypto_trades_loaded = False
 

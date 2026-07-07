@@ -161,8 +161,12 @@ def main():
         ticker = r["ticker"]
         date_str = r["date"]
 
-        # Skip obviously bad data (2024 date is likely wrong)
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        # Skip obviously bad data (non-dates, pre-2026)
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            print(f"  SKIP {ticker} @ {date_str} (invalid date format)")
+            continue
         if dt.year < 2026:
             print(f"  SKIP {ticker} @ {date_str} (pre-2026, likely stale)")
             continue

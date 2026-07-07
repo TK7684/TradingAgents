@@ -2,14 +2,17 @@
 import os
 from tradingagents.default_config import DEFAULT_CONFIG
 
-ZAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-ZAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://open.bigmodel.cn/api/coding/paas/v4")
+ZAI_API_KEY = os.getenv("ZHIPU_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+ZAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 
 
 def get_config(profile="default"):
     """Get config by profile name."""
     config = DEFAULT_CONFIG.copy()
-    config["llm_provider"] = "openai"
+    # Route through glm provider registry — upstream v0.3.x registers GLM as
+    # OpenAI-compatible with the correct base_url, avoiding the Responses API
+    # that native OpenAI uses (which would break our Z.AI endpoint).
+    config["llm_provider"] = "glm"
     config["backend_url"] = ZAI_BASE_URL
 
     # Rate-limit-safe settings for Z.AI

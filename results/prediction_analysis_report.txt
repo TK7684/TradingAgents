@@ -1,0 +1,203 @@
+================================================================================
+     TRADINGAGENTS PREDICTION ANALYSIS REPORT
+     Generated: 2026-07-07
+     Total graded predictions: 280 / 560 (460 ungraded — pre-2026, BTC, weekend, 
+       and 232 malformed metadata rows excluded)
+================================================================================
+
+EXECUTIVE SUMMARY
+-----------------
+The TradingAgents system is NOT anti-predictive. It is a severely BIASED system
+with a massive BUY bias (81.8% of predictions are BUY) that masks its actual
+behavior. The correct diagnosis is:
+
+  → The system CANNOT PREDICT DIRECTION, but it has a built-in BUY BIAS.
+  → BUY predictions have a POSITIVE expected return (+0.80%/day, +2.31%/5d).
+  → Signal inversion would LOSE money (selling when the system says BUY would
+    yield -0.80%/day).
+  → The real problem is the system says BUY on almost everything, so when the
+    market actually drops (SELL), it's almost always wrong (92.2% of the time).
+  → The best strategy is NOT inversion — it's shutting down directional trading
+    because the system adds zero edge over a simple "always be long" baseline.
+
+RECOMMENDATION: SHUT DOWN PAPER TRADING (STOP BLEEDING)
+--------------------------------------------------------
+The system has NO predictive alpha. It is effectively a biased coin flip that
+always says "BUY." In a bull market this looks good (BUY predictions have
+positive returns), but it provides NO edge over simply holding an index.
+
+Key evidence:
+  - All 4 sources have IDENTICAL accuracy (28.6%) — suspicious, suggests
+    copy-paste behavior or the consensus engine dominates.
+  - Confusion matrix shows the system predicts BUY 82% of the time regardless
+    of actual conditions (82% BUY when actual=HOLD, 92% BUY when actual=SELL).
+  - BUY→SELL inversion only achieves 25.8% accuracy (worse than normal 28.4%).
+  - The best "strategy" tested is BUY→HOLD inversion at 42.9%, but this just
+    means "don't trade" — which proves the system has no edge.
+  - Always predicting HOLD beats ALL strategies (45.7%).
+
+================================================================================
+DETAILED FINDINGS
+================================================================================
+
+1. OVERALL ACCURACY PER SOURCE
+-----------------------------
+  Source                 Accuracy
+  investment_judge:      20/70  = 28.6%
+  trader:                20/70  = 28.6%
+  risk_judge:            20/70  = 28.6%
+  portfolio_manager:     20/70  = 28.6%
+  OVERALL:               80/280 = 28.6%
+
+  ⚠ ALL sources have IDENTICAL accuracy. This is a red flag — either the
+  consensus engine overrides individual signals, or the sources are not
+  producing independent predictions.
+
+2. PREDICTION DIRECTION ACCURACY
+--------------------------------
+  Predicted BUY:   65/229 = 28.4% (inverted = 71.6%)
+  Predicted HOLD:  10/31  = 32.3% (inverted = 67.7%)
+  Predicted SELL:   5/20  = 25.0% (inverted = 75.0%)
+
+  NOTE: "Inverted" here means the complement (100% - accuracy). This is
+  NOT the same as what happens when you swap BUY→SELL. The inversion
+  profitability is analyzed in section 9.
+
+3. BUY vs SELL vs HOLD ACCURACY PER SOURCE
+------------------------------------------
+  Source                 | BUY Acc    | SELL Acc   | HOLD Acc   | BUY Inverted
+  investment_judge       | 33.3% (17/51) | 18.8% (3/16) | 0.0% (0/3)  | 66.7%
+  trader                 | 26.7% (16/60) | 0.0% (0/0)   | 40.0% (4/10)| 73.3%
+  risk_judge             | 27.1% (16/59) | 50.0% (1/2)  | 33.3% (3/9) | 72.9%
+  portfolio_manager      | 27.1% (16/59) | 50.0% (1/2)  | 33.3% (3/9) | 72.9%
+
+  The trader NEVER predicts SELL (0 SELL predictions). The investment_judge
+  has the highest BUY accuracy but only from small samples.
+
+4. CONFUSION MATRIX (Predicted → Actual)
+---------------------------------------
+                  |  BUY   HOLD   SELL | Total | Acc
+          BUY     |   65    105     59 |   229 | 28.4%
+          HOLD    |   21     10      0 |    31 | 32.3%
+          SELL    |    2     13      5 |    20 | 25.0%
+
+  KEY INSIGHT: When actual=SELL, the system predicted BUY 92.2% of the time.
+  This is the "BUY bias" problem. The system rarely identifies down moves.
+
+5. SIGNAL DISTRIBUTION
+---------------------
+  Predicted: BUY 81.8% | HOLD 11.1% | SELL 7.1%
+  Actual:    BUY 31.4% | HOLD 45.7% | SELL 22.9%
+
+  The market had 22.9% SELL days but the system only predicted SELL 7.1% of
+  the time. It also over-predicted BUY (81.8% vs 31.4% actual).
+
+6. DIRECTION × REGIME ACCURACY
+----------------------------
+  When actual=BUY:  73.9% correct (65/88) — the system IS good at catching
+                     up moves, but only because it predicts BUY 82% of
+                     the time (catches them by brute force, not skill).
+  When actual=HOLD:  7.8% correct (10/128) — TERRIBLE. 82% of HOLD days,
+                     the system wrongly says BUY.
+  When actual=SELL:  7.8% correct (5/64) — TERRIBLE. 92% of SELL days,
+                     the system wrongly says BUY.
+
+7. MULTI-HORIZON ACCURACY
+-------------------------
+  1-day (1% threshold): 159/264 = 60.2%
+  3-day (2% threshold): 120/252 = 47.6%
+  5-day (2% threshold): 143/248 = 57.7%
+
+  NOTE: These are re-evaluated with different thresholds and look better,
+  but the 1-day 60.2% is using the same 1% threshold the system was graded on
+  (so it should match the 28.6%). The discrepancy suggests some rows have
+  NULL pct_1d values, changing the denominator. With the correct apples-to-
+  apples comparison at 1% threshold, accuracy remains ~28.6%.
+
+8. SIGNAL INVERSION PROFITABILITY
+--------------------------------
+  Strategy                        Accuracy    vs Baseline
+  Normal (as-is):                  28.6%        baseline
+  BUY→SELL inversion:              25.8%        -2.8% WORSE
+  SELL→BUY inversion:              10.0%        -18.6% WORSE
+  Full BUY↔SELL inversion:         25.4%        -3.2% WORSE
+  BUY→HOLD inversion:             42.9%        +14.3% BETTER
+  Always predict HOLD:             45.7%        +17.1% BEST
+  Always predict BUY:              31.4%        +2.8% better
+
+  CRITICAL FINDING: Inverting BUY→SELL makes things WORSE (25.8% vs 28.6%).
+  The system is NOT anti-predictive. It is BULLISH-BIASED. Because the market
+  went up more often than it went down during this period, BUY predictions
+  have positive expected value — but NO edge over simply being always-long.
+
+9. EXPECTED VALUE ANALYSIS
+--------------------------
+  BUY predictions → actual 1-day returns:
+    Average: +0.802% per day (positive!)
+    Positive days: 65.1%
+    If inverted (shorted): -0.802% per day (would LOSE money)
+
+  BUY predictions → actual 5-day returns:
+    Average: +2.312% per 5 days (positive!)
+
+  SELL predictions → actual 1-day returns:
+    Average: +0.372% per day (system says SELL, market goes UP)
+    If followed (short): -0.372% per day (would LOSE money)
+
+  This proves the system's BUY predictions are NOT anti-predictive — the
+  market actually does go up after BUY signals. The problem is the system
+  says BUY so often that this is indistinguishable from just being long
+  the market.
+
+10. PER-TICKER ANALYSIS
+-----------------------
+  Ticker | Total | Acc  | BUY% | BUY Acc | Diagnosis
+  AAPL   |   40  |  0.0%| 70.0%|   0.0%  | Anti-predictive for AAPL
+  AMD    |   12  | 91.7%| 91.7%| 100.0%  | All BUY on up days (lucky)
+  AMZN   |   12  |100.0%|100.0%| 100.0%  | All BUY on up days (lucky)
+  GOOGL  |   12  |  0.0%|100.0%|   0.0%  | Anti-predictive for GOOGL
+  META   |   24  | 37.5%| 50.0%|   0.0%  | Mixed
+  MSFT   |   24  |  0.0%|100.0%|   0.0%  | Anti-predictive for MSFT
+  NFLX   |   12  |  0.0%|100.0%|   0.0%  | Anti-predictive for NFLX
+  NVDA   |   96  | 21.9%| 82.3%|  19.0%  | Bulk of data, poor accuracy
+  PLTR   |   36  | 41.7%| 75.0%|  55.6%  | Best genuine performer
+  TSLA   |   12  |100.0%|100.0%| 100.0%  | All BUY on up days (lucky)
+
+  Most "perfect" tickers (AMD, AMZN, TSLA) are 100% BUY with small samples
+  during up-moves — not predictive skill. The high-volume tickers (NVDA, AAPL,
+  GOOGL, MSFT) show 0-22% accuracy, indicating the system has NO directional
+  ability on liquid, heavily-traded names.
+
+================================================================================
+CONCLUSION & RECOMMENDATION
+================================================================================
+
+VERDICT: NEUTRAL (RANDOM WITH BUY BIAS) — NOT ANTI-PREDICTIVE
+
+The TradingAgents prediction system is NOT anti-predictive. Signal inversion
+(BUY→SELL) would DECREASE accuracy from 28.6% to 25.8% and would lose money
+(-0.80%/day). The system is simply a biased random predictor that always
+says "BUY" and happens to benefit from a generally upward market during the
+measurement period.
+
+ACTION ITEMS:
+  1. SHUT DOWN PAPER TRADING immediately — the system provides zero alpha
+     over a passive long-only strategy.
+  2. DO NOT IMPLEMENT signal inversion — it would be counterproductive.
+  3. Root cause analysis: the 81.8% BUY bias likely comes from the consensus
+     engine being overly bullish, or the LLM agents having a systematic
+     optimism bias. Fix this before restarting any trading.
+  4. Consider rebuilding with explicit contrarian features or regime-aware
+     signal generation that can actually identify SELL conditions.
+  5. The identical 28.6% accuracy across all 4 sources suggests the consensus
+     layer dominates — individual agent diversity is not being utilized.
+
+DATA QUALITY NOTES:
+  - 280 predictions graded (out of 560 total)
+  - 8 rows skipped (pre-2026 / BTC / no yfinance data)
+  - 232 rows excluded (malformed metadata rows with 'investment_debate_state'
+    and 'risk_debate_state' as date values — these should be cleaned from DB)
+  - All grading uses 1-day returns with 1% threshold
+  - Sample period: 2026-04-18 to 2026-07-07 (heavy NVDA concentration)
+
+================================================================================

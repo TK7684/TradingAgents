@@ -1,144 +1,150 @@
-"""Financial situation memory using BM25 for lexical similarity matching.
+"""Financial situation memory — dual backend.
 
-Uses BM25 (Best Matching 25) algorithm for retrieval - no API calls,
-no token limits, works offline with any LLM provider.
+Phase 1 (v0.2.x): BM25 vector memory for lexical matching.
+Phase 2 (v0.3.x): Append-only markdown decision log (TradingMemoryLog) from upstream.
+
+This module provides:
+- FinancialSituationMemory: BM25 backend (kept for bull/bear/trader agents that use get_memories)
+- TradingMemoryLog: Append-only markdown log (used by portfolio manager for past_context)
 """
 
-from rank_bm25 import BM25Okapi
-from typing import List, Tuple
 import re
+from pathlib import Path
+from typing import List
+
+from rank_bm25 import BM25Okapi
+
+
+class TradingMemoryLog:
+    """Append-only markdown log of trading decisions and reflections.
+
+    Ported from upstream v0.3.1.
+    """
+    _SEPARATOR = "\n\n<!-- ENTRY_END -->\n\n"
+    _DECISION_RE = re.compile(r"DECISION:\n(.*?)(?=\nREFLECTION:|\Z)", re.DOTALL)
+    _REFLECTION_RE = re.compile(r"REFLECTION:\n(.*?)$", re.DOTALL)
+
+    def __init__(self, config: dict = None):
+        cfg = config or {}
+        self._log_path = None
+        path = cfg.get("memory_log_path")
+        if path:
+            self._log_path = Path(path).expanduser()
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._max_entries = cfg.get("memory_log_max_entries")
+
+    def store_decision(self, ticker: str, trade_date: str, final_trade_decision: str) -> None:
+        if not self._log_path:
+            return
+        from tradingagents.agents.utils.rating import parse_rating
+        if self._log_path.exists():
+            raw = self._log_path.read_text(encoding="utf-8")
+            for line in raw.splitlines():
+                if line.startswith(f"[{trade_date} | {ticker} |") and line.endswith("| pending]"):
+                    return
+        rating = parse_rating(final_trade_decision)
+        tag = f"[{trade_date} | {ticker} | {rating} | pending]"
+        entry = f"{tag}\n\nDECISION:\n{final_trade_decision}{self._SEPARATOR}"
+        with open(self._log_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+
+    def load_entries(self) -> list:
+        if not self._log_path or not self._log_path.exists():
+            return []
+        text = self._log_path.read_text(encoding="utf-8")
+        raw_entries = [e.strip() for e in text.split(self._SEPARATOR) if e.strip()]
+        entries = []
+        for raw in raw_entries:
+            first_line = raw.splitlines()[0] if raw.splitlines() else ""
+            m = re.match(
+                r"\[(\d{4}-\d{2}-\d{2})\s*\|\s*(\S+)\s*\|\s*(\w+)\s*\|\s*(\w+)\]",
+                first_line,
+            )
+            if not m:
+                continue
+            date_str, ticker, rating, status = m.groups()
+            dec_m = self._DECISION_RE.search(raw)
+            ref_m = self._REFLECTION_RE.search(raw)
+            entries.append({
+                "date": date_str,
+                "ticker": ticker,
+                "rating": rating,
+                "status": status,
+                "decision": dec_m.group(1).strip() if dec_m else "",
+                "reflection": ref_m.group(1).strip() if ref_m else "",
+            })
+        return entries
+
+    def get_pending_entries(self) -> list:
+        return [e for e in self.load_entries() if e["status"] == "pending"]
+
+    def get_past_context(self, company_name: str, limit: int = 5) -> str:
+        entries = self.load_entries()
+        relevant = [e for e in entries if e["status"] == "resolved"]
+        if not relevant:
+            return ""
+        recent = relevant[-limit:]
+        parts = []
+        for e in recent:
+            part = f"[{e['date']} | {e['ticker']}] Rating: {e['rating']}"
+            if e.get("reflection"):
+                part += f" — Reflection: {e['reflection'][:200]}"
+            parts.append(part)
+        return "\n".join(parts)
+
+    def batch_update_with_outcomes(self, updates: list) -> None:
+        if not self._log_path or not self._log_path.exists():
+            return
+        text = self._log_path.read_text(encoding="utf-8")
+        for ticker, trade_date, outcome in updates:
+            tag = f"[{trade_date} | {ticker} |"
+            lines = text.splitlines()
+            for i, line in enumerate(lines):
+                if line.startswith(tag) and "| pending]" in line:
+                    lines[i] = line.replace("| pending]", f"| resolved]")
+                    break
+            text = "\n".join(lines)
+        self._log_path.write_text(text, encoding="utf-8")
 
 
 class FinancialSituationMemory:
-    """Memory system for storing and retrieving financial situations using BM25."""
+    """BM25-based memory for bull/bear/trader agents.
 
+    Kept for backward compatibility — agents still call get_memories().
+    """
     def __init__(self, name: str, config: dict = None):
-        """Initialize the memory system.
-
-        Args:
-            name: Name identifier for this memory instance
-            config: Configuration dict (kept for API compatibility, not used for BM25)
-        """
         self.name = name
         self.documents: List[str] = []
         self.recommendations: List[str] = []
         self.bm25 = None
 
     def _tokenize(self, text: str) -> List[str]:
-        """Tokenize text for BM25 indexing.
-
-        Simple whitespace + punctuation tokenization with lowercasing.
-        """
-        # Lowercase and split on non-alphanumeric characters
-        tokens = re.findall(r'\b\w+\b', text.lower())
-        return tokens
+        return re.findall(r'\b\w+\b', text.lower())
 
     def _rebuild_index(self):
-        """Rebuild the BM25 index after adding documents."""
         if self.documents:
             tokenized_docs = [self._tokenize(doc) for doc in self.documents]
             self.bm25 = BM25Okapi(tokenized_docs)
-        else:
-            self.bm25 = None
 
-    def add_situations(self, situations_and_advice: List[Tuple[str, str]]):
-        """Add financial situations and their corresponding advice.
-
-        Args:
-            situations_and_advice: List of tuples (situation, recommendation)
-        """
-        for situation, recommendation in situations_and_advice:
-            self.documents.append(situation)
-            self.recommendations.append(recommendation)
-
-        # Rebuild BM25 index with new documents
+    def add_situation(self, situation: str, recommendation: str):
+        self.documents.append(situation)
+        self.recommendations.append(recommendation)
         self._rebuild_index()
 
-    def get_memories(self, current_situation: str, n_matches: int = 1) -> List[dict]:
-        """Find matching recommendations using BM25 similarity.
+    def add_situations(self, situations: list):
+        for s in situations:
+            if isinstance(s, dict):
+                self.add_situation(s.get("situation", ""), s.get("recommendation", ""))
+            else:
+                self.add_situation(str(s), "")
 
-        Args:
-            current_situation: The current financial situation to match against
-            n_matches: Number of top matches to return
-
-        Returns:
-            List of dicts with matched_situation, recommendation, and similarity_score
-        """
-        if not self.documents or self.bm25 is None:
+    def get_memories(self, situation: str, n_matches: int = 3) -> list:
+        if not self.bm25 or not self.documents:
             return []
-
-        # Tokenize query
-        query_tokens = self._tokenize(current_situation)
-
-        # Get BM25 scores for all documents
+        query_tokens = self._tokenize(situation)
         scores = self.bm25.get_scores(query_tokens)
-
-        # Get top-n indices sorted by score (descending)
         top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:n_matches]
-
-        # Build results
-        results = []
-        max_score = max(scores) if max(scores) > 0 else 1  # Normalize scores
-
-        for idx in top_indices:
-            # Normalize score to 0-1 range for consistency
-            normalized_score = scores[idx] / max_score if max_score > 0 else 0
-            results.append({
-                "matched_situation": self.documents[idx],
-                "recommendation": self.recommendations[idx],
-                "similarity_score": normalized_score,
-            })
-
-        return results
-
-    def clear(self):
-        """Clear all stored memories."""
-        self.documents = []
-        self.recommendations = []
-        self.bm25 = None
-
-
-if __name__ == "__main__":
-    # Example usage
-    matcher = FinancialSituationMemory("test_memory")
-
-    # Example data
-    example_data = [
-        (
-            "High inflation rate with rising interest rates and declining consumer spending",
-            "Consider defensive sectors like consumer staples and utilities. Review fixed-income portfolio duration.",
-        ),
-        (
-            "Tech sector showing high volatility with increasing institutional selling pressure",
-            "Reduce exposure to high-growth tech stocks. Look for value opportunities in established tech companies with strong cash flows.",
-        ),
-        (
-            "Strong dollar affecting emerging markets with increasing forex volatility",
-            "Hedge currency exposure in international positions. Consider reducing allocation to emerging market debt.",
-        ),
-        (
-            "Market showing signs of sector rotation with rising yields",
-            "Rebalance portfolio to maintain target allocations. Consider increasing exposure to sectors benefiting from higher rates.",
-        ),
-    ]
-
-    # Add the example situations and recommendations
-    matcher.add_situations(example_data)
-
-    # Example query
-    current_situation = """
-    Market showing increased volatility in tech sector, with institutional investors
-    reducing positions and rising interest rates affecting growth stock valuations
-    """
-
-    try:
-        recommendations = matcher.get_memories(current_situation, n_matches=2)
-
-        for i, rec in enumerate(recommendations, 1):
-            print(f"\nMatch {i}:")
-            print(f"Similarity Score: {rec['similarity_score']:.2f}")
-            print(f"Matched Situation: {rec['matched_situation']}")
-            print(f"Recommendation: {rec['recommendation']}")
-
-    except Exception as e:
-        print(f"Error during recommendation: {str(e)}")
+        return [
+            {"recommendation": self.recommendations[i], "score": float(scores[i])}
+            for i in top_indices if scores[i] > 0
+        ]

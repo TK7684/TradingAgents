@@ -1,0 +1,13 @@
+{
+  "date": "2026-07-07",
+  "profile": "turbo",
+  "results": [
+    {
+      "ticker": "NVDA",
+      "date": "2026-07-07",
+      "decision": null,
+      "status": "error",
+      "error": "'global_news_queries'"
+    }
+  ]
+}
