@@ -198,16 +198,24 @@ class PredictionDriftScorer:
             ).fetchone()
             return row[0] if row else 0.0
 
-    def get_metrics(self, symbol: str, lookback_days: int = 30) -> dict:
-        """Get rolling metrics for a symbol."""
+    def get_metrics(self, symbol: str, lookback_days: int = 0) -> dict:
+        """Get rolling metrics for a symbol. lookback_days=0 means all history."""
         with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute("""
-                SELECT correct_direction, magnitude_error
-                FROM predictions
-                WHERE symbol = ? AND scored = 1
-                AND date >= date('now', ?)
-                ORDER BY date DESC
-            """, (symbol, f"-{lookback_days} days")).fetchall()
+            if lookback_days > 0:
+                rows = conn.execute("""
+                    SELECT correct_direction, magnitude_error
+                    FROM predictions
+                    WHERE symbol = ? AND scored = 1
+                    AND date >= date('now', ?)
+                    ORDER BY date DESC
+                """, (symbol, f"-{lookback_days} days")).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT correct_direction, magnitude_error
+                    FROM predictions
+                    WHERE symbol = ? AND scored = 1
+                    ORDER BY date DESC
+                """, (symbol,)).fetchall()
 
         if not rows:
             return {

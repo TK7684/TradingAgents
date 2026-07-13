@@ -141,6 +141,42 @@ def main():
     conn.close()
     engine.close()
 
+    # --- Drift scoring (prediction_drift_scorer.py) ---
+    # Feed scored predictions into drift evaluator for strategy health tracking
+    try:
+        sys.path.insert(0, os.path.expanduser("~/TradingAgents"))
+        from prediction_drift_scorer import PredictionDriftScorer
+
+        drift_db = os.path.expanduser("~/TradingAgents/results/prediction_drift.db")
+        scorer = PredictionDriftScorer(drift_db)
+
+        # Pull all scored predictions for this date and feed to drift scorer
+        conn2 = sqlite3.connect(db_path)
+        conn2.row_factory = sqlite3.Row
+        scored = conn2.execute(
+            "SELECT ticker, date, signal as pred_dir, actual_signal FROM predictions WHERE date = ? AND actual_signal IS NOT NULL",
+            (date_str,),
+        ).fetchall()
+        conn2.close()
+
+        for s in scored:
+            dir_map = {"BUY": "bullish", "SELL": "bearish", "HOLD": "neutral"}
+            pred_dir = dir_map.get(s["actual_signal"], "neutral")
+            # Record + score in drift DB
+            scorer.record(s["ticker"], s["date"], dir_map.get(s["signal"], "neutral"), 0.0)
+            scorer.score(s["ticker"], s["date"], pred_dir, 0.0)
+
+        # Evaluate drift for each ticker scored today
+        tickers_today = list(set(s["ticker"] for s in scored))
+        if tickers_today:
+            print(f"\n=== Prediction Drift Report ({date_str}) ===")
+            for ticker in tickers_today:
+                report = scorer.evaluate_drift(ticker)
+                rec = report.get("recommendation", "")
+                print(f"  {ticker}: {report['signal']} ({report['status']}) — {rec}")
+    except Exception as e:
+        print(f"  Drift scoring skipped: {e}")
+
 
 if __name__ == "__main__":
     main()
