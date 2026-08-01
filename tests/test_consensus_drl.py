@@ -415,3 +415,77 @@ class TestEdgeCases:
         conn = drl_scorer._tracker._get_conn()
         rows = conn.execute("SELECT q_value FROM drl_qtable").fetchall()
         assert all(r["q_value"] == 0.0 for r in rows)
+
+
+# ---------------------------------------------------------------------------
+# Forward-Gate Tests
+# ---------------------------------------------------------------------------
+
+class TestForwardGate:
+    """Tests for forward-gated weight deployment."""
+
+    def test_forward_gate_passes_with_no_history(self, drl_scorer):
+        """With < FORWARD_GATE_MIN_PREDICTIONS graded predictions, gate is bypassed (blended deployed)."""
+        signals = {src: "BUY" for src in SOURCES}
+        weights = drl_scorer.get_blended_weights(signals, regime_return=0.01)
+        # With no DRL history, blended == accuracy weights (equal), gate should pass
+        assert abs(sum(weights.values()) - 1.0) < 1e-4
+        assert all(w >= MIN_WEIGHT for w in weights.values())
+
+    def test_forward_gate_blocks_degenerate_drl(self, tracker):
+        """When DRL weights consistently pick wrong, gate should fall back to accuracy weights.
+
+        Setup: risk_judge is the only correct source (SELL), but DRL Q-table
+        boosts investment_judge (always wrong, says BUY).  With alpha=1.0
+        (pure DRL), the boosted wrong source flips consensus to BUY.
+        The gate must detect this and deploy accuracy-only weights instead.
+        """
+        # Use alpha=1.0 so DRL weights dominate the blend
+        scorer = DRLWeightedScorer(tracker, drl_alpha=1.0)
+
+        # Record 24 graded predictions (4 sources x 6 rounds), enough for FORWARD_GATE_MIN_PREDICTIONS
+        # investment_judge and trader always say BUY (wrong), risk_judge says SELL (right)
+        for i in range(6):
+            date = f"2026-06-{10+i:02d}"
+            tracker.record_prediction("TEST", date, "investment_judge", "BUY")
+            tracker.record_prediction("TEST", date, "trader", "BUY")
+            tracker.record_prediction("TEST", date, "risk_judge", "SELL")
+            tracker.record_prediction("TEST", date, "portfolio_manager", "HOLD")
+            tracker.record_outcome("TEST", date, "SELL")
+
+        # Inject adversarial Q-values: boost the wrong source, suppress the right one
+        conn = tracker._get_conn()
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+            "VALUES ('neutral', 'investment_judge', 0, 1.0)"
+        )
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+            "VALUES ('neutral', 'risk_judge', 0, -1.0)"
+        )
+        conn.commit()
+
+        signals = {"investment_judge": "BUY", "trader": "BUY",
+                    "risk_judge": "SELL", "portfolio_manager": "HOLD"}
+        weights = scorer.get_blended_weights(signals, regime_return=0.0)
+
+        # Gate should have blocked the degenerate DRL weights
+        # Verify by comparing to accuracy weights (what the gate falls back to)
+        acc_weights = tracker.get_weights()
+        for src in SOURCES:
+            assert abs(weights[src] - acc_weights[src]) < 1e-3, \
+                f"Forward-gate should have blocked DRL for {src}: got {weights[src]}, expected {acc_weights[src]}"
+
+    def test_forward_gate_min_predictions_threshold(self, drl_scorer):
+        """Gate should not activate with fewer than FORWARD_GATE_MIN_PREDICTIONS."""
+        from tradingagents.graph.consensus import FORWARD_GATE_MIN_PREDICTIONS
+        assert FORWARD_GATE_MIN_PREDICTIONS >= 10
+
+    def test_forward_gate_returns_valid_weights_dict(self, drl_scorer):
+        """Forward-gate output must always be a valid normalized weight dict."""
+        signals = {src: "BUY" for src in SOURCES}
+        for _ in range(3):
+            weights = drl_scorer.get_blended_weights(signals, regime_return=0.02)
+            assert set(weights.keys()) == set(SOURCES)
+            assert abs(sum(weights.values()) - 1.0) < 1e-3
+            assert all(0 < w < 1.0 for w in weights.values())

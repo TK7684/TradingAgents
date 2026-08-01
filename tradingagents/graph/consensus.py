@@ -98,6 +98,12 @@ DRL_DISCOUNT_FACTOR: float = 0.9
 DRL_DECAY_LAMBDA: float = 0.07
 DRL_MAX_WEIGHT_ADJUST: float = 0.15
 
+# Forward-Gate: validate DRL weights before deployment (arxiv:2607.xxxxx "Train Often, Deploy Selectively")
+# Minimum graded predictions needed to run forward validation.
+FORWARD_GATE_MIN_PREDICTIONS: int = 20
+# Number of recent predictions to validate against.
+FORWARD_GATE_WINDOW: int = 20
+
 # ---------------------------------------------------------------------------
 # Regex patterns (mirrors signal_processing.py)
 
@@ -856,7 +862,90 @@ class DRLWeightedScorer:
                 (1.0 - self.drl_alpha) * aw + self.drl_alpha * dw, 4
             )
 
-        return blended
+        # --- Forward-Gate: validate DRL weights before deployment ---
+        # If DRL-blended weights would have produced more wrong consensus
+        # signals than accuracy-only weights on recent predictions, fall back
+        # to accuracy-only weights for this cycle.
+        gated = self._forward_gate(accuracy_weights, blended)
+        return gated
+
+    def _forward_gate(
+        self,
+        accuracy_weights: Dict[str, float],
+        blended_weights: Dict[str, float],
+    ) -> Dict[str, float]:
+        """Forward-gated weight deployment (paper: "Train Often, Deploy Selectively").
+
+        Compares *blended_weights* against *accuracy_weights* by simulating
+        weighted-vote consensus on recent graded predictions.  If accuracy-only
+        weights produce fewer incorrect signals, the DRL component is gated off
+        for this cycle and accuracy weights are returned instead.
+
+        This prevents a degenerating Q-table from dragging down performance —
+        the DRL weights must *earn* deployment by winning on a forward check.
+
+        Args:
+            accuracy_weights: Pure accuracy-based weights.
+            blended_weights:  DRL-alpha-blended weights (candidate for deployment).
+
+        Returns:
+            The weights to actually deploy (blended if gate passed, accuracy if not).
+        """
+        conn = self._tracker._get_conn()
+        # Fetch recent graded predictions
+        rows = conn.execute(
+            "SELECT source, predicted_signal, actual_signal FROM predictions "
+            "WHERE actual_signal IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?",
+            (FORWARD_GATE_WINDOW,),
+        ).fetchall()
+
+        if len(rows) < FORWARD_GATE_MIN_PREDICTIONS:
+            # Not enough data to validate — deploy blended (safe: alpha is small)
+            return blended_weights
+
+        # Group recent predictions by (ticker, date) pseudo-groups using row index.
+        # We approximate "evaluation rounds" as groups of 4 (one per source).
+        rounds = [rows[i:i + len(SOURCES)] for i in range(0, len(rows) - len(SOURCES) + 1, len(SOURCES))]
+
+        acc_score = 0  # how often accuracy-weights pick the right consensus
+        drl_score = 0
+
+        for group in rounds:
+            if len(group) < 2:
+                continue
+            # Build weighted vote for each weight set
+            for weights, score_ref in [(accuracy_weights, "acc"), (blended_weights, "drl")]:
+                vote = {"BUY": 0.0, "HOLD": 0.0, "SELL": 0.0}
+                actuals = set()
+                for row in group:
+                    src = row["source"]
+                    pred = row["predicted_signal"]
+                    actual = row["actual_signal"]
+                    w = weights.get(src, 0.25)
+                    if pred in vote:
+                        vote[pred] += w
+                    actuals.add(actual)
+                consensus = max(vote, key=vote.get)
+                # Score: did the weighted consensus match any actual?
+                if consensus in actuals:
+                    if score_ref == "acc":
+                        acc_score += 1
+                    else:
+                        drl_score += 1
+
+        if acc_score > drl_score:
+            log.info(
+                "Forward-Gate: BLOCKED DRL weights (acc=%d vs drl=%d on %d rounds) — deploying accuracy-only",
+                acc_score, drl_score, len(rounds),
+            )
+            return accuracy_weights
+
+        log.debug(
+            "Forward-Gate: PASSED (acc=%d vs drl=%d) — deploying blended",
+            acc_score, drl_score,
+        )
+        return blended_weights
 
     def record_reward(
         self,
