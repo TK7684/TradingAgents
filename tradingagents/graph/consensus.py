@@ -96,6 +96,7 @@ DRL_ALPHA: float = 0.3
 DRL_LEARNING_RATE: float = 0.15
 DRL_DISCOUNT_FACTOR: float = 0.9
 DRL_DECAY_LAMBDA: float = 0.07
+DRL_TRACE_LAMBDA: float = 0.7  # TD(lambda) eligibility trace decay rate
 DRL_MAX_WEIGHT_ADJUST: float = 0.15
 
 # Forward-Gate: validate DRL weights before deployment (arxiv:2607.xxxxx "Train Often, Deploy Selectively")
@@ -348,6 +349,7 @@ class AccuracyTracker:
             source          TEXT    NOT NULL,
             streak_bucket   INTEGER NOT NULL,
             q_value         REAL    NOT NULL DEFAULT 0.0,
+            eligibility_trace REAL NOT NULL DEFAULT 0.0,
             PRIMARY KEY (regime_bucket, source, streak_bucket)
         );
     """
@@ -978,23 +980,39 @@ class DRLWeightedScorer:
 
         conn = self._tracker._get_conn()
 
+        # TD(lambda): decay ALL eligibility traces by gamma * lambda
+        gamma = self.discount_factor
+        lam = DRL_TRACE_LAMBDA
+        decay = gamma * lam
+        conn.execute(
+            "UPDATE drl_qtable SET eligibility_trace = eligibility_trace * ?",
+            (decay,),
+        )
+
         # Get recent streak for each source (last 5 predictions)
         for source in SOURCES:
             streak = self._get_source_recent_correct(source, limit=5)
             streak_bucket = _discretize_streak(streak)
 
-            # Fetch current Q-value
+            # Fetch current Q-value and eligibility trace
             row = conn.execute(
-                "SELECT q_value FROM drl_qtable "
+                "SELECT q_value, eligibility_trace FROM drl_qtable "
                 "WHERE regime_bucket = ? AND source = ? AND streak_bucket = ?",
                 (regime_bucket, source, streak_bucket),
             ).fetchone()
 
             old_q = row["q_value"] if row else 0.0
+            old_trace = row["eligibility_trace"] if row else 0.0
 
-            # Q-learning update: Q(s,a) = Q(s,a) + lr * (reward + gamma * max_Q(s',a') - Q(s,a))
-            # For simplicity, max_Q(s',a') is estimated as 0 (no next-state model)
-            new_q = old_q + self.learning_rate * (reward - old_q)
+            # TD error: delta = reward + gamma * max_Q(s',a') - Q(s,a)
+            # max_Q(s',a') estimated as 0 (no next-state model)
+            td_error = reward - old_q
+
+            # Increment eligibility trace for visited state-action
+            e = old_trace + 1.0
+
+            # Q-learning update with eligibility trace
+            new_q = old_q + self.learning_rate * td_error * e
 
             # Compute weight adjustment from Q-value, clamped
             weight_adjust = max(
@@ -1002,13 +1020,13 @@ class DRLWeightedScorer:
                 min(self.max_weight_adjust, new_q * 0.05),
             )
 
-            # Upsert Q-table
+            # Upsert Q-table (including eligibility trace)
             conn.execute(
-                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
-                "VALUES (?, ?, ?, ?) "
+                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value, eligibility_trace) "
+                "VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(regime_bucket, source, streak_bucket) "
-                "DO UPDATE SET q_value = excluded.q_value",
-                (regime_bucket, source, streak_bucket, new_q),
+                "DO UPDATE SET q_value = excluded.q_value, eligibility_trace = excluded.eligibility_trace",
+                (regime_bucket, source, streak_bucket, new_q, e),
             )
 
             # Record reward history
@@ -1060,7 +1078,7 @@ class DRLWeightedScorer:
     def reset_qtable(self) -> None:
         """Reset all Q-values to 0 (for testing)."""
         conn = self._tracker._get_conn()
-        conn.execute("UPDATE drl_qtable SET q_value = 0.0")
+        conn.execute("UPDATE drl_qtable SET q_value = 0.0, eligibility_trace = 0.0")
         conn.commit()
 
     # -- private helpers ------------------------------------------------------

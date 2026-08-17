@@ -22,6 +22,8 @@ from tradingagents.graph.consensus import (
     DRL_ALPHA,
     DRL_LEARNING_RATE,
     DRL_DECAY_LAMBDA,
+    DRL_DISCOUNT_FACTOR,
+    DRL_TRACE_LAMBDA,
     DRL_MAX_WEIGHT_ADJUST,
     MIN_WEIGHT,
     SOURCES,
