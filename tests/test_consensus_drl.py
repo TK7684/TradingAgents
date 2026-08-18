@@ -256,6 +256,73 @@ class TestRewardRecording:
             assert row["q_value"] > 0
 
 
+class TestPerSourceCreditAssignment:
+    """Per-source credit assignment (arxiv:2607.18001).
+
+    Each source must be rewarded by whether ITS OWN signal matched the
+    actual outcome — not the consensus verdict.  Before this, all four
+    sources received identical rewards and Q-values could not diverge.
+    """
+
+    def test_differentiated_rewards(self, drl_scorer):
+        signals = {
+            "investment_judge": "SELL",   # wrong (actual BUY)
+            "trader": "BUY",              # right
+            "risk_judge": "BUY",          # right
+            "portfolio_manager": "HOLD",  # neutral
+        }
+        drl_scorer.record_reward(
+            ticker="AAPL", date_str="2026-06-10",
+            source_signals=signals,
+            predicted_signal="BUY", actual_signal="BUY",
+            regime_return=0.01,
+        )
+        hist = drl_scorer.get_reward_history(limit=10)
+        by_source = {r["source"]: r["reward"] for r in hist}
+        assert by_source["trader"] == 1.0
+        assert by_source["risk_judge"] == 1.0
+        assert by_source["investment_judge"] == -1.0
+        assert by_source["portfolio_manager"] == 0.0
+
+    def test_qvalues_diverge_by_skill(self, drl_scorer):
+        """After repeated rounds, correct sources converge +1, wrong converge -1."""
+        signals = {
+            "investment_judge": "SELL",
+            "trader": "BUY",
+            "risk_judge": "BUY",
+            "portfolio_manager": "HOLD",
+        }
+        for i in range(20):
+            drl_scorer.record_reward(
+                ticker="AAPL", date_str=f"2026-06-{i+1:02d}",
+                source_signals=signals,
+                predicted_signal="BUY", actual_signal="BUY",
+                regime_return=0.01,
+            )
+        conn = drl_scorer._tracker._get_conn()
+        rows = conn.execute(
+            "SELECT source, q_value FROM drl_qtable WHERE regime_bucket='neutral'"
+        ).fetchall()
+        q = {}
+        for r in rows:
+            q[r["source"]] = max(q.get(r["source"], -9.0), r["q_value"])
+        assert q["trader"] > 0.9
+        assert q["risk_judge"] > 0.9
+        assert q["investment_judge"] < -0.9
+        assert abs(q["portfolio_manager"]) < 0.01
+
+    def test_absent_source_falls_back_to_consensus(self, drl_scorer):
+        """Sources missing from source_signals get the consensus-level reward."""
+        drl_scorer.record_reward(
+            ticker="AAPL", date_str="2026-06-10",
+            source_signals={},  # no per-source info
+            predicted_signal="BUY", actual_signal="BUY",
+            regime_return=0.01,
+        )
+        hist = drl_scorer.get_reward_history(limit=10)
+        assert all(r["reward"] == 1.0 for r in hist)
+
+
 # ---------------------------------------------------------------------------
 # Decay
 # ---------------------------------------------------------------------------

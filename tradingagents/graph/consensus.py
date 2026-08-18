@@ -960,7 +960,10 @@ class DRLWeightedScorer:
     ) -> None:
         """Record a reward for the DRL Q-table and update weights.
 
-        Reward: +1 for correct consensus, -1 for incorrect, 0 for HOLD outcomes.
+        Per-source credit assignment: each source is rewarded by whether
+        its OWN signal matched the actual outcome (+1 correct, -1 wrong,
+        0 when HOLD is involved).  Sources absent from *source_signals*
+        fall back to the consensus-level reward.
 
         Updates the ``drl_rewards`` table and then performs a Q-learning
         update on the ``drl_qtable``.
@@ -968,13 +971,28 @@ class DRLWeightedScorer:
         predicted = predicted_signal.upper()
         actual = actual_signal.upper()
 
-        # Compute reward
+        # Consensus-level reward (kept for the log line and as fallback)
         if predicted == actual:
             reward = 1.0
         elif predicted == "HOLD" or actual == "HOLD":
             reward = 0.0
         else:
             reward = -1.0
+
+        # Per-source credit assignment (arxiv:2607.18001):
+        # reward each source by whether ITS OWN signal matched the actual
+        # outcome, not the consensus verdict.  Without this, every source
+        # receives the identical reward and the Q-table cannot distinguish
+        # skilled from unskilled sources.
+        def _source_reward(sig: Optional[str]) -> float:
+            if sig is None:
+                return reward  # absent source falls back to consensus reward
+            s = sig.upper()
+            if s == actual:
+                return 1.0
+            if s == "HOLD" or actual == "HOLD":
+                return 0.0
+            return -1.0
 
         regime_bucket = _discretize_regime(regime_return)
 
@@ -1004,9 +1022,12 @@ class DRLWeightedScorer:
             old_q = row["q_value"] if row else 0.0
             old_trace = row["eligibility_trace"] if row else 0.0
 
+            # Per-source reward: did THIS source's own signal match actual?
+            src_reward = _source_reward(source_signals.get(source))
+
             # TD error: delta = reward + gamma * max_Q(s',a') - Q(s,a)
             # max_Q(s',a') estimated as 0 (no next-state model)
-            td_error = reward - old_q
+            td_error = src_reward - old_q
 
             # Increment eligibility trace for visited state-action
             e = old_trace + 1.0
@@ -1037,7 +1058,7 @@ class DRLWeightedScorer:
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     ticker, date_str, source, regime_bucket, streak,
-                    predicted, actual, reward, weight_adjust,
+                    predicted, actual, src_reward, weight_adjust,
                 ),
             )
 
