@@ -109,6 +109,17 @@ FORWARD_GATE_MIN_PREDICTIONS: int = 20
 # Number of recent predictions to validate against.
 FORWARD_GATE_WINDOW: int = 20
 
+# Experience-Replay optimization (arxiv:2607.18001 RL reward optimisation loop):
+# Replays graded historical predictions through the Q-learning update until
+# the mean |TD error| converges, so weights are optimised from *all* past
+# outcomes rather than the single most recent one.
+#: Max replay passes over the historical buffer.
+REPLAY_MAX_EPOCHS: int = 50
+#: Mean |TD error| below this => converged.
+REPLAY_CONVERGENCE_TOL: float = 1e-4
+#: Max graded predictions replayed per call (most recent first).
+REPLAY_BUFFER_LIMIT: int = 500
+
 # ---------------------------------------------------------------------------
 # Regex patterns (mirrors signal_processing.py)
 
@@ -1087,6 +1098,195 @@ class DRLWeightedScorer:
             (limit,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def optimize_weights_from_history(
+        self,
+        max_epochs: int = REPLAY_MAX_EPOCHS,
+        convergence_tol: float = REPLAY_CONVERGENCE_TOL,
+        buffer_limit: int = REPLAY_BUFFER_LIMIT,
+    ) -> Dict[str, Any]:
+        """Experience-replay reward optimisation loop (RL from historical outcomes).
+
+        Replays the most recent *buffer_limit* graded predictions through the
+        same Q-learning update used online (``record_reward``) until the table
+        converges (max per-pass Q-movement below *convergence_tol*) or
+        *max_epochs* passes are reached.
+
+        Fidelity notes (vs the online path):
+
+        * Rounds are replayed in chronological order and each source's streak
+          bucket is recomputed *as it was at that round* (running last-5
+          correctness), so streaks evolve during replay exactly as they did
+          when outcomes resolved live.
+        * Each pass reads Q-values from a start-of-pass snapshot (fitted-value
+          iteration): one effective Bellman step per table entry per pass,
+          which contracts geometrically to the fixed point.
+        * Regime is not stored per prediction; replay keys the ``neutral``
+          regime bucket (the online path keys regime at reward time only).
+        * The ``predictions`` table is never mutated — replay only writes
+          ``drl_qtable``.
+
+        Returns:
+            Dict with ``epochs``, ``converged``, ``final_td_error``,
+            ``td_error_history`` (per-epoch mean |TD error|) and
+            ``q_movement_history`` (per-epoch max |Delta Q| vs pass start).
+        """
+        conn = self._tracker._get_conn()
+        rows = conn.execute(
+            "SELECT ticker, date, source, predicted_signal, actual_signal, correct "
+            "FROM predictions WHERE actual_signal IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?",
+            (buffer_limit,),
+        ).fetchall()
+
+        if not rows:
+            return {
+                "epochs": 0,
+                "converged": True,
+                "final_td_error": 0.0,
+                "td_error_history": [],
+                "q_movement_history": [],
+            }
+
+        # Group graded predictions into evaluation rounds (one row per
+        # source, as recorded), oldest-first for chronological replay.
+        groups = [rows[i:i + len(SOURCES)] for i in range(0, len(rows), len(SOURCES))]
+        groups = [g for g in groups if len(g) == len(SOURCES)]
+        groups.reverse()  # chronological order
+
+        # Precompute, chronologically, each round's consensus verdict, reward,
+        # and per-source (streak_bucket, next_bucket) as they were at that
+        # point in history — identical to what record_reward would have seen.
+        replay_rounds: list = []
+        streak_hist: Dict[str, list] = {s: [] for s in SOURCES}  # last-5 correctness
+
+        for group in groups:
+            source_signals = {r["source"]: r["predicted_signal"] for r in group}
+            vote = {"BUY": 0.0, "HOLD": 0.0, "SELL": 0.0}
+            actual = None
+            for r in group:
+                if r["predicted_signal"] in vote:
+                    vote[r["predicted_signal"]] += 1.0
+                if r["actual_signal"] and actual is None:
+                    actual = r["actual_signal"]
+            if actual is None:
+                # keep streak history consistent even for ungraded edge rounds
+                for r in group:
+                    src = r["source"]
+                    streak_hist.setdefault(src, []).append(int(r["correct"] or 0))
+                    streak_hist[src] = streak_hist[src][-5:]
+                continue
+
+            predicted = max(vote, key=vote.get) if any(vote.values()) else "HOLD"
+
+            if predicted == actual:
+                reward = 1.0
+            elif predicted == "HOLD" or actual == "HOLD":
+                reward = 0.0
+            else:
+                reward = -1.0
+
+            regime_bucket = "neutral"
+            per_source: list = []
+            for source in SOURCES:
+                # This round's graded outcome for the source, then the streak
+                # as seen at reward time: last 5 graded predictions INCLUDING
+                # the current round (record_reward runs after record_outcome
+                # graded it).
+                corr = next(
+                    (int(r["correct"] or 0) for r in group if r["source"] == source), 0
+                )
+                hist = (streak_hist.get(source, []) + [corr])[-5:]
+                streak = sum(hist)
+                streak_bucket = _discretize_streak(streak)
+
+                raw_sig = source_signals.get(source)
+                src_sig = raw_sig.upper() if raw_sig is not None else None
+                if src_sig is None:
+                    boot_correct = predicted == actual and predicted != "HOLD"
+                else:
+                    boot_correct = src_sig == actual and src_sig != "HOLD"
+                next_bucket = _discretize_streak(streak + 1) if boot_correct else 0
+
+                per_source.append((source, streak_bucket, next_bucket))
+
+                # advance the running streak history with this round's outcome
+                streak_hist.setdefault(source, []).append(corr)
+                streak_hist[source] = streak_hist[source][-5:]
+
+            replay_rounds.append((reward, regime_bucket, per_source))
+
+        td_error_history: list = []
+        q_movement_history: list = []
+        converged = False
+
+        for epoch in range(1, max_epochs + 1):
+            # Start-of-pass snapshot: every update this pass bootstraps from
+            # these values (fitted-value iteration — one effective Bellman
+            # step per entry per pass, geometric contraction to the fixpoint).
+            q_snapshot: Dict[Tuple[str, str, int], float] = {
+                (row["regime_bucket"], row["source"], row["streak_bucket"]): row["q_value"]
+                for row in conn.execute(
+                    "SELECT regime_bucket, source, streak_bucket, q_value FROM drl_qtable"
+                ).fetchall()
+            }
+
+            epoch_td_errors: list = []
+            epoch_movements: list = []
+
+            for reward, regime_bucket, per_source in replay_rounds:
+                for source, streak_bucket, next_bucket in per_source:
+                    key = (regime_bucket, source, streak_bucket)
+                    old_q = q_snapshot.get(key, 0.0)
+
+                    if next_bucket == streak_bucket:
+                        # self-transition: bootstrap from the current estimate
+                        next_q = old_q
+                    else:
+                        next_q = q_snapshot.get(
+                            (regime_bucket, source, next_bucket), 0.0
+                        )
+
+                    td_error = reward + self.discount_factor * next_q - old_q
+                    new_q = old_q + self.learning_rate * td_error
+                    epoch_td_errors.append(abs(td_error))
+                    epoch_movements.append(abs(new_q - old_q))
+
+                    conn.execute(
+                        "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+                        "VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(regime_bucket, source, streak_bucket) "
+                        "DO UPDATE SET q_value = excluded.q_value",
+                        (regime_bucket, source, streak_bucket, new_q),
+                    )
+
+            conn.commit()
+
+            mean_td = sum(epoch_td_errors) / len(epoch_td_errors) if epoch_td_errors else 0.0
+            max_movement = max(epoch_movements) if epoch_movements else 0.0
+            td_error_history.append(round(mean_td, 6))
+            q_movement_history.append(round(max_movement, 8))
+            log.debug(
+                "Replay epoch %d: mean |TD error| = %.6f, max |dQ| = %.8f (%d updates)",
+                epoch, mean_td, max_movement, len(epoch_td_errors),
+            )
+
+            # Convergence criterion: maximum per-pass Q-table movement.
+            # Mean |TD error| settles at a non-zero constant under mixed
+            # rewards (it measures residual Bellman inconsistency, not
+            # progress); the table's contraction towards its fixed point is
+            # the true convergence signal.
+            if max_movement < convergence_tol:
+                converged = True
+                break
+
+        return {
+            "epochs": len(td_error_history),
+            "converged": converged,
+            "final_td_error": td_error_history[-1] if td_error_history else 0.0,
+            "td_error_history": td_error_history,
+            "q_movement_history": q_movement_history,
+        }
 
     def decay_old_rewards(self) -> int:
         """Apply exponential decay to all DRL Q-values.

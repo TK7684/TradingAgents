@@ -24,6 +24,8 @@ from tradingagents.graph.consensus import (
     DRL_DECAY_LAMBDA,
     DRL_MAX_WEIGHT_ADJUST,
     MIN_WEIGHT,
+    REPLAY_MAX_EPOCHS,
+    REPLAY_CONVERGENCE_TOL,
     SOURCES,
 )
 
@@ -702,3 +704,173 @@ class TestAdaptiveLRDecay:
             assert row["visit_count"] == 0, "backfilled default is 0"
         finally:
             tracker.close()
+
+
+# ---------------------------------------------------------------------------
+# Experience-replay optimisation loop (H20260824150137)
+# ---------------------------------------------------------------------------
+
+class TestReplayOptimization:
+    """optimize_weights_from_history: RL reward loop over graded predictions."""
+
+    def _seed_history(self, tracker, n_rounds=6):
+        """Seed graded predictions: one round = 4 sources, same ticker/date."""
+        for i in range(n_rounds):
+            date = f"2026-08-{i+1:02d}"
+            actual = "BUY" if i % 2 == 0 else "SELL"
+            # trader always correct, risk_judge always wrong, others mixed
+            signals = {
+                "investment_judge": "BUY" if i % 3 == 0 else actual,
+                "trader": actual,
+                "risk_judge": "SELL" if actual == "BUY" else "BUY",
+                "portfolio_manager": actual if i % 2 == 0 else "HOLD",
+            }
+            for source, sig in signals.items():
+                tracker.record_prediction("AAPL", date, source, sig)
+            tracker.record_outcome("AAPL", date, actual)
+
+    def test_replay_returns_stats_dict(self, drl_scorer):
+        result = drl_scorer.optimize_weights_from_history()
+        assert isinstance(result, dict)
+        assert set(result) >= {"epochs", "converged", "final_td_error", "td_error_history"}
+        assert result["epochs"] == 0
+        assert result["converged"] is True
+        assert result["td_error_history"] == []
+
+    def test_replay_empty_history_converges_immediately(self, drl_scorer):
+        result = drl_scorer.optimize_weights_from_history()
+        assert result["epochs"] == 0
+        assert result["final_td_error"] == 0.0
+
+    def test_replay_runs_and_updates_qtable(self, tracker, drl_scorer):
+        self._seed_history(tracker)
+        result = drl_scorer.optimize_weights_from_history(max_epochs=5)
+        assert result["epochs"] >= 1
+        assert result["epochs"] <= 5
+        assert result["td_error_history"], "at least one epoch ran"
+        conn = tracker._get_conn()
+        nonzero = conn.execute(
+            "SELECT COUNT(*) FROM drl_qtable WHERE q_value != 0"
+        ).fetchone()[0]
+        assert nonzero > 0, "Q-table must be updated by replay"
+
+    def test_replay_converges_within_max_epochs(self, tracker, drl_scorer):
+        self._seed_history(tracker, n_rounds=10)
+        result = drl_scorer.optimize_weights_from_history(max_epochs=REPLAY_MAX_EPOCHS)
+        assert result["epochs"] <= REPLAY_MAX_EPOCHS
+        # with a tiny buffer it must converge or hit the cap
+        assert result["converged"] is True or result["epochs"] == REPLAY_MAX_EPOCHS
+        # monotone non-increasing tail is expected under fixed-point iteration;
+        # verify errors are finite
+        assert all(0 <= e < float("inf") for e in result["td_error_history"])
+
+    def test_replay_td_error_decreases(self, tracker, drl_scorer):
+        """Mean |TD error| tracks residual Bellman inconsistency; falls as the
+        table approaches its fixed point (first pass dominates movement)."""
+        self._seed_history(tracker, n_rounds=10)
+        result = drl_scorer.optimize_weights_from_history(max_epochs=30)
+        hist = result["td_error_history"]
+        assert len(hist) >= 3, f"expected multiple epochs, got {hist}"
+        assert hist[-1] < hist[0], (
+            f"mean |TD error| should decrease over epochs: {hist}"
+        )
+
+    def test_replay_fixed_point_analytic(self, tracker, drl_scorer):
+        """Constant reward + self-transition => Q converges to r/(1-gamma).
+
+        All sources always correct => consensus always correct => reward=+1
+        every round; every source sits in the max streak bucket 4 (buckets
+        merge streaks 4-5; streak+1 clamps to a self-transition). Analytic
+        fixed point: Q* = 1/(1-0.9) = 10.
+        """
+        import math as _math
+
+        def seed_all_correct(n_rounds):
+            for i in range(n_rounds):
+                date = f"2026-09-{i+1:02d}"
+                for source in SOURCES:
+                    tracker.record_prediction("MSFT", date, source, "BUY")
+                tracker.record_outcome("MSFT", date, "BUY")
+
+        seed_all_correct(12)
+        result = drl_scorer.optimize_weights_from_history(max_epochs=800)
+        assert result["converged"] is True, (
+            f"must converge: {result['td_error_history'][-5:]}"
+        )
+        conn = tracker._get_conn()
+        row = conn.execute(
+            "SELECT q_value FROM drl_qtable "
+            "WHERE regime_bucket = 'neutral' AND source = 'trader' "
+            "AND streak_bucket = 4"
+        ).fetchone()
+        expected = 1.0 / (1.0 - drl_scorer.discount_factor)  # = 10.0
+        assert row is not None, "trader/streak-5 entry must exist"
+        assert _math.isclose(row["q_value"], expected, rel_tol=0.01), (
+            f"Q* should equal r/(1-gamma)={expected}, got {row['q_value']}"
+        )
+
+    def test_replay_fixed_point_wrong_forever(self, tracker, drl_scorer):
+        """All-wrong consensus: reward=-1 every round, streak stays 0,
+        next_bucket=0 == streak_bucket (self-transition) => the analytic
+        fixed point Q* = -1/(1-gamma) = -10 must emerge.
+        """
+        import math as _math
+
+        for i in range(12):
+            date = f"2026-09-{i+1:02d}"
+            for source in SOURCES:
+                tracker.record_prediction("MSFT", date, source, "SELL")
+            tracker.record_outcome("MSFT", date, "BUY")
+
+        result = drl_scorer.optimize_weights_from_history(max_epochs=800)
+        assert result["converged"] is True
+        conn = tracker._get_conn()
+        row = conn.execute(
+            "SELECT q_value FROM drl_qtable "
+            "WHERE regime_bucket = 'neutral' AND source = 'trader' "
+            "AND streak_bucket = 0"
+        ).fetchone()
+        expected = -1.0 / (1.0 - drl_scorer.discount_factor)  # = -10.0
+        assert row is not None, "trader/streak-0 entry must exist"
+        assert _math.isclose(row["q_value"], expected, rel_tol=0.01), (
+            f"Q* should equal r/(1-gamma)={expected}, got {row['q_value']}"
+        )
+
+    def test_replay_respects_buffer_limit(self, tracker, drl_scorer):
+        self._seed_history(tracker, n_rounds=20)
+        result = drl_scorer.optimize_weights_from_history(
+            max_epochs=3, buffer_limit=8
+        )
+        # buffer_limit=8 -> 2 rounds replayed; must run without error
+        assert result["epochs"] == 3  # tiny buffer keeps TD error > tol
+        assert len(result["td_error_history"]) == 3
+
+    def test_replay_snapshot_semantics_idempotent_tail(self, tracker, drl_scorer):
+        """Near convergence, an extra pass should barely move Q-values."""
+        self._seed_history(tracker, n_rounds=8)
+        drl_scorer.optimize_weights_from_history(max_epochs=40)
+        conn = tracker._get_conn()
+        before = conn.execute(
+            "SELECT SUM(q_value) FROM drl_qtable"
+        ).fetchone()[0]
+        drl_scorer.optimize_weights_from_history(max_epochs=1)
+        after = conn.execute(
+            "SELECT SUM(q_value) FROM drl_qtable"
+        ).fetchone()[0]
+        assert abs(after - before) < 0.5, (
+            f"converged replay should be near-idempotent: before={before}, after={after}"
+        )
+
+    def test_replay_does_not_touch_predictions_table(self, tracker, drl_scorer):
+        self._seed_history(tracker, n_rounds=6)
+        conn = tracker._get_conn()
+        before = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+        drl_scorer.optimize_weights_from_history(max_epochs=3)
+        after = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+        assert before == after, "replay must never mutate the history it learns from"
+
+    def test_replay_clean_state_zero_q(self, drl_scorer):
+        """Fresh scorer, no history: replay is a no-op leaving Q-table at 0."""
+        result = drl_scorer.optimize_weights_from_history()
+        assert result["final_td_error"] == 0.0
+        drl_scorer.reset_qtable()  # still works after replay
