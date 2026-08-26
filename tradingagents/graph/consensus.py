@@ -992,9 +992,33 @@ class DRLWeightedScorer:
 
             old_q = row["q_value"] if row else 0.0
 
-            # Q-learning update: Q(s,a) = Q(s,a) + lr * (reward + gamma * max_Q(s',a') - Q(s,a))
-            # For simplicity, max_Q(s',a') is estimated as 0 (no next-state model)
-            new_q = old_q + self.learning_rate * (reward - old_q)
+            # TD(0) bootstrap: estimate the next-state value Q(s', a') from the
+            # streak bucket the source transitions into after this prediction
+            # resolves.  A correct directional call advances the streak
+            # (bucket streak+1); a miss resets it to 0.  This restores the
+            # canonical Q-learning rule
+            #   Q(s,a) += lr * (r + gamma * Q(s',a') - Q(s,a))
+            # replacing the degenerate max_Q(s',a') = 0 shortcut that collapsed
+            # the Bellman equation into a plain EMA and left discount_factor
+            # dormant in the TD error (AGI cycle H20260826150153).
+            boot_correct = predicted == actual and predicted != "HOLD"
+            next_bucket = _discretize_streak(streak + 1) if boot_correct else 0
+            if next_bucket == streak_bucket:
+                # self-transition: bootstrap from the current estimate
+                next_q = old_q
+            else:
+                next_row = conn.execute(
+                    "SELECT q_value FROM drl_qtable "
+                    "WHERE regime_bucket = ? AND source = ? AND streak_bucket = ?",
+                    (regime_bucket, source, next_bucket),
+                ).fetchone()
+                next_q = next_row["q_value"] if next_row else 0.0
+
+            # TD error with bootstrap: delta = r + gamma * Q(s',a') - Q(s,a)
+            td_error = reward + self.discount_factor * next_q - old_q
+
+            # Q-learning update with restored bootstrap term
+            new_q = old_q + self.learning_rate * td_error
 
             # Compute weight adjustment from Q-value, clamped
             weight_adjust = max(
