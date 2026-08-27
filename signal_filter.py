@@ -22,6 +22,14 @@ BLOCK_THRESHOLD = 20    # accuracy % below this → block (requires 20+ predicti
 WARN_THRESHOLD = 25     # source accuracy % below this → warn/downweight
 MIN_PREDICTIONS = 20    # minimum predictions before blocking a ticker
 
+# Empirical-Bayes (beta-binomial) shrinkage for ticker accuracy.
+# Raw correct/total overfits small samples; shrink toward the 50% neutral
+# prior by EB_PRIOR_STRENGTH pseudo-observations. Matches the convention
+# already deployed for source weights in tradingagents/graph/consensus.py
+# (BAYES_PRIOR_STRENGTH = 5). A 1/1 ticker no longer reads as 100%.
+EB_PRIOR_MEAN = 0.5     # neutral prior mean (no data = coin flip)
+EB_PRIOR_STRENGTH = 5   # pseudo-observations pulling toward the prior
+
 
 class SignalFilter:
     """Filter trading signals based on historical prediction accuracy."""
@@ -95,7 +103,14 @@ class SignalFilter:
     # ── Internal helpers ─────────────────────────────────────────────────
 
     def _ticker_accuracy(self, ticker: str) -> tuple[float, int]:
-        """Return (accuracy_pct, total_predictions) for a ticker."""
+        """Return (EB-shrunk accuracy_pct, total_predictions) for a ticker.
+
+        accuracy = (correct + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN) /
+                   (n + EB_PRIOR_STRENGTH) * 100
+
+        Small samples are pulled toward 50%, so a 1/1 ticker reads as
+        ~58.3% instead of 100%, and 2/8 reads as ~36.7% instead of 25%.
+        """
         conn = sqlite3.connect(self.db_path)
         row = conn.execute(
             "SELECT COUNT(*), SUM(correct) FROM predictions WHERE ticker = ?",
@@ -104,8 +119,10 @@ class SignalFilter:
         conn.close()
         if not row or row[0] == 0:
             return 50.0, 0  # no data = assume neutral
-        accuracy = (row[1] or 0) / row[0] * 100
-        return accuracy, row[0]
+        n = row[0]
+        correct = row[1] or 0
+        shrunk = (correct + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN) / (n + EB_PRIOR_STRENGTH)
+        return shrunk * 100, n
 
     def _anti_signal_consistency(self, ticker: str, signal: str) -> float:
         """Measure how often predictions disagree with actual outcomes.
