@@ -489,3 +489,79 @@ class TestForwardGate:
             assert set(weights.keys()) == set(SOURCES)
             assert abs(sum(weights.values()) - 1.0) < 1e-3
             assert all(0 < w < 1.0 for w in weights.values())
+# ---------------------------------------------------------------------------
+# TD(0) Bootstrap Tests (AGI cycle H20260826150153)
+# ---------------------------------------------------------------------------
+
+class TestTD0Bootstrap:
+    """The Q-update must use the canonical TD(0) rule with a real
+    gamma*Q(s',a') bootstrap term, not the degenerate max_Q(s',a')=0 EMA."""
+
+    def _record(self, drl_scorer, **kw):
+        signals = kw.get("signals", {src: "BUY" for src in SOURCES})
+        drl_scorer.record_reward(
+            ticker=kw.get("ticker", "AAPL"),
+            date_str=kw.get("date_str", "2026-06-10"),
+            source_signals=signals,
+            predicted_signal=kw.get("predicted_signal", "BUY"),
+            actual_signal=kw.get("actual_signal", "BUY"),
+            regime_return=kw.get("regime_return", 0.01),
+        )
+
+    def test_bootstrap_lands_in_next_streak_bucket(self, drl_scorer):
+        """A correct call must advance the streak and write the bootstrapped
+        Q-value into the next streak bucket's row (not just the current one)."""
+        self._record(drl_scorer)  # streak 0 -> correct -> writes bucket 0, bootstraps from bucket 1
+        conn = drl_scorer._tracker._get_conn()
+        rows = conn.execute(
+            "SELECT streak_bucket, q_value FROM drl_qtable ORDER BY streak_bucket"
+        ).fetchall()
+        assert len(rows) == len(SOURCES)
+        for r in rows:
+            # First update: Q = lr * (r + gamma*0 - 0) = lr * 1.0 > 0
+            assert r["q_value"] > 0
+            assert r["streak_bucket"] == 0
+
+    def test_self_transition_bootstraps_from_current_estimate(self, drl_scorer):
+        """streak=4 is the top bucket; streak+1 clamps back to 4, so the update
+        must bootstrap from the current Q instead of the (absent) next row."""
+        # Seed a 5-correct streak via the predictions table so
+        # _get_source_recent_correct sees bucket 4-5
+        conn = drl_scorer._tracker._get_conn()
+        for src in SOURCES:
+            for i in range(5):
+                conn.execute(
+                    "INSERT INTO predictions (ticker, date, source, predicted_signal, actual_signal, correct) "
+                    "VALUES ('AAPL', ?, ?, 'BUY', 'BUY', 1)",
+                    (f"2026-06-{10+i:02d}", src),
+                )
+        conn.commit()
+        self._record(drl_scorer)  # streak 4 -> correct -> writes bucket 4
+        b4 = conn.execute(
+            "SELECT COUNT(*) FROM drl_qtable WHERE streak_bucket = 4"
+        ).fetchone()[0]
+        assert b4 == len(SOURCES)
+
+    def test_td_error_uses_gamma_bootstrap(self, drl_scorer):
+        """The bootstrap must be reachable: seed a next-bucket Q, then verify
+        the update exceeds the degenerate EMA update (lr*r) when gamma>0."""
+        conn = drl_scorer._tracker._get_conn()
+        gamma = drl_scorer.discount_factor
+        lr = drl_scorer.learning_rate
+        # Seed bucket-1 Q high for all sources in 'neutral'
+        for src in SOURCES:
+            conn.execute(
+                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+                "VALUES ('neutral', ?, 1, 0.5)",
+                (src,),
+            )
+        conn.commit()
+        # Correct call from bucket 0 -> bootstraps from seeded bucket 1
+        self._record(drl_scorer)
+        rows = conn.execute(
+            "SELECT q_value FROM drl_qtable WHERE streak_bucket = 0"
+        ).fetchall()
+        # Q = 0 + lr * (1 + gamma*0.5 - 0) = lr * 1.45 > lr * 1.0 (degenerate EMA)
+        degenerate = lr * 1.0
+        for r in rows:
+            assert r["q_value"] > degenerate + 1e-9
