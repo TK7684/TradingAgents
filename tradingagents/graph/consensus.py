@@ -98,6 +98,11 @@ DRL_DISCOUNT_FACTOR: float = 0.9
 DRL_DECAY_LAMBDA: float = 0.07
 DRL_MAX_WEIGHT_ADJUST: float = 0.15
 
+#: Per-state visit-count adaptive LR decay: lr_n = lr_0 / (1 + n * lr_decay).
+#: Fresh states learn fast; mature states refine slowly, damping late-stage
+#: Q-value overshoot as estimates converge (lr halves after ~20 visits).
+DRL_LR_DECAY: float = 0.05
+
 # Forward-Gate: validate DRL weights before deployment (arxiv:2607.xxxxx "Train Often, Deploy Selectively")
 # Minimum graded predictions needed to run forward validation.
 FORWARD_GATE_MIN_PREDICTIONS: int = 20
@@ -348,6 +353,7 @@ class AccuracyTracker:
             source          TEXT    NOT NULL,
             streak_bucket   INTEGER NOT NULL,
             q_value         REAL    NOT NULL DEFAULT 0.0,
+            visit_count     INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (regime_bucket, source, streak_bucket)
         );
     """
@@ -377,6 +383,15 @@ class AccuracyTracker:
         conn.executescript(
             self._DDL_PREDICTIONS + self._DDL_STATS + self._DDL_DRL_REWARDS + self._DDL_DRL_QTABLE
         )
+        # Migration: older DBs predate the visit_count column (adaptive-LR
+        # experiment H20260829150109). CREATE TABLE IF NOT EXISTS is a no-op
+        # on existing tables, so backfill via ALTER TABLE.
+        try:
+            conn.execute(
+                "ALTER TABLE drl_qtable ADD COLUMN visit_count INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.commit()
 
     def close(self) -> None:
@@ -772,6 +787,7 @@ class DRLWeightedScorer:
         discount_factor: float = DRL_DISCOUNT_FACTOR,
         decay_lambda: float = DRL_DECAY_LAMBDA,
         max_weight_adjust: float = DRL_MAX_WEIGHT_ADJUST,
+        lr_decay: float = DRL_LR_DECAY,
     ):
         self._tracker = accuracy_tracker
         self._base_scorer = ConfidenceScorer(accuracy_tracker)
@@ -780,6 +796,7 @@ class DRLWeightedScorer:
         self.discount_factor = discount_factor
         self.decay_lambda = decay_lambda
         self.max_weight_adjust = max_weight_adjust
+        self.lr_decay = lr_decay
 
     # -- public interface ------------------------------------------------------
 
@@ -983,14 +1000,15 @@ class DRLWeightedScorer:
             streak = self._get_source_recent_correct(source, limit=5)
             streak_bucket = _discretize_streak(streak)
 
-            # Fetch current Q-value
+            # Fetch current Q-value and per-state visit count
             row = conn.execute(
-                "SELECT q_value FROM drl_qtable "
+                "SELECT q_value, visit_count FROM drl_qtable "
                 "WHERE regime_bucket = ? AND source = ? AND streak_bucket = ?",
                 (regime_bucket, source, streak_bucket),
             ).fetchone()
 
             old_q = row["q_value"] if row else 0.0
+            old_visit = row["visit_count"] if row else 0
 
             # TD(0) bootstrap: estimate the next-state value Q(s', a') from the
             # streak bucket the source transitions into after this prediction
@@ -1017,8 +1035,15 @@ class DRLWeightedScorer:
             # TD error with bootstrap: delta = r + gamma * Q(s',a') - Q(s,a)
             td_error = reward + self.discount_factor * next_q - old_q
 
+            # Per-state visit-count adaptive LR decay:
+            #   lr_n = lr_0 / (1 + n * lr_decay)
+            # Fresh state-actions take full-size steps; the step shrinks as
+            # visits accumulate (harmonic-series convergence), damping
+            # late-stage overshoot around the converged Q-value.
+            effective_lr = self.learning_rate / (1.0 + old_visit * self.lr_decay)
+
             # Q-learning update with restored bootstrap term
-            new_q = old_q + self.learning_rate * td_error
+            new_q = old_q + effective_lr * td_error
 
             # Compute weight adjustment from Q-value, clamped
             weight_adjust = max(
@@ -1028,10 +1053,11 @@ class DRLWeightedScorer:
 
             # Upsert Q-table
             conn.execute(
-                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
-                "VALUES (?, ?, ?, ?) "
+                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value, visit_count) "
+                "VALUES (?, ?, ?, ?, 1) "
                 "ON CONFLICT(regime_bucket, source, streak_bucket) "
-                "DO UPDATE SET q_value = excluded.q_value",
+                "DO UPDATE SET q_value = excluded.q_value, "
+                "visit_count = visit_count + 1",
                 (regime_bucket, source, streak_bucket, new_q),
             )
 
