@@ -436,6 +436,7 @@ class AccuracyTracker:
             source          TEXT    NOT NULL,
             streak_bucket   INTEGER NOT NULL,
             q_value         REAL    NOT NULL DEFAULT 0.0,
+            q_value_b       REAL    NOT NULL DEFAULT 0.0,
             visit_count     INTEGER NOT NULL DEFAULT 0,
             eligibility     REAL    NOT NULL DEFAULT 0.0,
             PRIMARY KEY (regime_bucket, source, streak_bucket)
@@ -482,6 +483,18 @@ class AccuracyTracker:
             conn.execute(
                 "ALTER TABLE drl_qtable ADD COLUMN eligibility REAL NOT NULL DEFAULT 0.0"
             )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Migration: double-Q second estimator (deploy of stranded experiment
+        # E20260816-double-q-bootstrap, recomposed onto the TD(lambda) +
+        # adaptive-LR lineage).  B is seeded from A so the deployed
+        # (A+B)/2 average equals the pre-migration single-estimate value and
+        # weights behave identically across the upgrade.
+        try:
+            conn.execute(
+                "ALTER TABLE drl_qtable ADD COLUMN q_value_b REAL NOT NULL DEFAULT 0.0"
+            )
+            conn.execute("UPDATE drl_qtable SET q_value_b = q_value")
         except sqlite3.OperationalError:
             pass  # column already exists
         conn.commit()
@@ -1173,14 +1186,15 @@ class DRLWeightedScorer:
             streak = self._get_source_recent_correct(source, limit=5)
             streak_bucket = _discretize_streak(streak)
 
-            # Fetch current Q-value and per-state visit count
+            # Fetch current Q-values (both double-Q estimators) and visit count
             row = conn.execute(
-                "SELECT q_value, visit_count FROM drl_qtable "
+                "SELECT q_value, q_value_b, visit_count FROM drl_qtable "
                 "WHERE regime_bucket = ? AND source = ? AND streak_bucket = ?",
                 (regime_bucket, source, streak_bucket),
             ).fetchone()
 
             old_q = row["q_value"] if row else 0.0
+            old_q_b = row["q_value_b"] if row else 0.0
             old_visit = row["visit_count"] if row else 0
 
             # TD(0) bootstrap: estimate the next-state value Q(s', a') from the
@@ -1195,18 +1209,26 @@ class DRLWeightedScorer:
             boot_correct = predicted == actual and predicted != "HOLD"
             next_bucket = _discretize_streak(streak + 1) if boot_correct else 0
             if next_bucket == streak_bucket:
-                # self-transition: bootstrap from the current estimate
-                next_q = old_q
+                # self-transition: bootstrap from the current averaged estimate
+                next_q = (old_q + old_q_b) / 2.0
             else:
                 next_row = conn.execute(
-                    "SELECT q_value FROM drl_qtable "
+                    "SELECT (q_value + q_value_b) / 2.0 AS avg_q FROM drl_qtable "
                     "WHERE regime_bucket = ? AND source = ? AND streak_bucket = ?",
                     (regime_bucket, source, next_bucket),
                 ).fetchone()
-                next_q = next_row["q_value"] if next_row else 0.0
+                next_q = next_row["avg_q"] if next_row else 0.0
 
-            # TD error with bootstrap: delta = r + gamma * Q(s',a') - Q(s,a)
-            td_error = reward + self.discount_factor * next_q - old_q
+            # Double-Q TD error (van Hasselt 2010, deploy of stranded
+            # E20260816-double-q-bootstrap): the error is computed against the
+            # *averaged* deployed estimator (Q_A + Q_B) / 2, and each update is
+            # broadcast into exactly ONE randomly-chosen estimator.  The random
+            # split makes Q_A and Q_B independent noise samples, which cancels
+            # the maximization bias of the single-estimate bootstrap (same
+            # noisy samples selecting AND estimating the max, ratcheting
+            # Q-values upward under noise).
+            old_q_avg = (old_q + old_q_b) / 2.0
+            td_error = reward + self.discount_factor * next_q - old_q_avg
 
             # Per-state visit-count adaptive LR decay:
             #   lr_n = lr_0 / (1 + n * lr_decay)
@@ -1214,15 +1236,6 @@ class DRLWeightedScorer:
             # visits accumulate (harmonic-series convergence), damping
             # late-stage overshoot around the converged Q-value.
             effective_lr = self.learning_rate / (1.0 + old_visit * self.lr_decay)
-
-            # Q-learning update with restored bootstrap term
-            new_q = old_q + effective_lr * td_error
-
-            # Compute weight adjustment from Q-value, clamped
-            weight_adjust = max(
-                -self.max_weight_adjust,
-                min(self.max_weight_adjust, new_q * 0.05),
-            )
 
             # TD(lambda) eligibility traces (deploy of stranded experiment
             # a6e5be4, recomposed onto the TD(0)-bootstrap + adaptive-LR
@@ -1240,18 +1253,35 @@ class DRLWeightedScorer:
             )
             conn.execute(
                 "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, "
-                "q_value, visit_count, eligibility) "
-                "VALUES (?, ?, ?, ?, 1, 1.0) "
+                "q_value, q_value_b, visit_count, eligibility) "
+                "VALUES (?, ?, ?, ?, ?, 1, 1.0) "
                 "ON CONFLICT(regime_bucket, source, streak_bucket) "
                 "DO UPDATE SET q_value = drl_qtable.q_value, "
+                "q_value_b = drl_qtable.q_value_b, "
                 "visit_count = drl_qtable.visit_count + 1, "
                 "eligibility = 1.0",
-                (regime_bucket, source, streak_bucket, old_q),
+                (regime_bucket, source, streak_bucket, old_q, old_q_b),
             )
+            # Double-Q: broadcast the delta into exactly ONE randomly-chosen
+            # estimator across every eligible state of this source.
+            col = "q_value" if random.random() < 0.5 else "q_value_b"
             conn.execute(
-                "UPDATE drl_qtable SET q_value = q_value + ? * eligibility "
+                f"UPDATE drl_qtable SET {col} = {col} + ? * eligibility "
                 "WHERE source = ? AND eligibility != 0",
                 (effective_lr * td_error, source),
+            )
+            # Re-read the deployed (averaged) Q for the weight adjustment.
+            updated_row = conn.execute(
+                "SELECT (q_value + q_value_b) / 2.0 AS avg_q FROM drl_qtable "
+                "WHERE regime_bucket = ? AND source = ? AND streak_bucket = ?",
+                (regime_bucket, source, streak_bucket),
+            ).fetchone()
+            new_q = updated_row["avg_q"] if updated_row else old_q_avg
+
+            # Compute weight adjustment from the averaged Q-value, clamped
+            weight_adjust = max(
+                -self.max_weight_adjust,
+                min(self.max_weight_adjust, new_q * 0.05),
             )
 
             # Record reward history
@@ -1574,8 +1604,10 @@ class DRLWeightedScorer:
         conn = self._tracker._get_conn()
         decay_factor = math.exp(-self.decay_lambda)
         cursor = conn.execute(
-            "UPDATE drl_qtable SET q_value = q_value * ? WHERE q_value != 0",
-            (decay_factor,),
+            "UPDATE drl_qtable SET q_value = q_value * ?, "
+            "q_value_b = q_value_b * ? "
+            "WHERE q_value != 0 OR q_value_b != 0",
+            (decay_factor, decay_factor),
         )
         conn.commit()
         return cursor.rowcount
@@ -1583,7 +1615,9 @@ class DRLWeightedScorer:
     def reset_qtable(self) -> None:
         """Reset all Q-values and eligibility traces to 0 (for testing)."""
         conn = self._tracker._get_conn()
-        conn.execute("UPDATE drl_qtable SET q_value = 0.0, eligibility = 0.0")
+        conn.execute(
+            "UPDATE drl_qtable SET q_value = 0.0, q_value_b = 0.0, eligibility = 0.0"
+        )
         conn.commit()
 
     # -- private helpers ------------------------------------------------------
@@ -1602,16 +1636,16 @@ class DRLWeightedScorer:
             streak_bucket = _discretize_streak(streak)
 
             row = conn.execute(
-                "SELECT q_value FROM drl_qtable "
+                "SELECT (q_value + q_value_b) / 2.0 AS avg_q FROM drl_qtable "
                 "WHERE regime_bucket = ? AND source = ? AND streak_bucket = ?",
                 (regime_bucket, source, streak_bucket),
             ).fetchone()
 
             if row:
-                # Convert Q-value to weight adjustment, clamped
+                # Convert averaged double-Q value to weight adjustment, clamped
                 adjustments[source] = max(
                     -self.max_weight_adjust,
-                    min(self.max_weight_adjust, row["q_value"] * 0.05),
+                    min(self.max_weight_adjust, row["avg_q"] * 0.05),
                 )
             else:
                 adjustments[source] = 0.0

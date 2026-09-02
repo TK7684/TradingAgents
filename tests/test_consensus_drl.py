@@ -256,11 +256,13 @@ class TestRewardRecording:
             regime_return=0.01,
         )
         conn = drl_scorer._tracker._get_conn()
-        rows = conn.execute("SELECT * FROM drl_qtable").fetchall()
+        rows = conn.execute(
+            f"SELECT {AVG_Q} AS avg_q FROM drl_qtable"
+        ).fetchall()
         assert len(rows) == len(SOURCES)
-        # Q-values should be positive (reward = +1)
+        # Averaged Q-values should be positive (reward = +1)
         for row in rows:
-            assert row["q_value"] > 0
+            assert row["avg_q"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -282,16 +284,16 @@ class TestDecay:
 
         # Get Q-values before decay
         conn = drl_scorer._tracker._get_conn()
-        before = {row["source"]: row["q_value"]
-                  for row in conn.execute("SELECT source, q_value FROM drl_qtable").fetchall()}
+        before = {row["source"]: row["avg_q"]
+                  for row in conn.execute(f"SELECT source, {AVG_Q} AS avg_q FROM drl_qtable").fetchall()}
 
         # Apply decay
         count = drl_scorer.decay_old_rewards()
         assert count > 0
 
         # Get Q-values after decay
-        after = {row["source"]: row["q_value"]
-                 for row in conn.execute("SELECT source, q_value FROM drl_qtable").fetchall()}
+        after = {row["source"]: row["avg_q"]
+                 for row in conn.execute(f"SELECT source, {AVG_Q} AS avg_q FROM drl_qtable").fetchall()}
 
         # All should be smaller
         for src in SOURCES:
@@ -527,12 +529,12 @@ class TestTD0Bootstrap:
         self._record(drl_scorer)  # streak 0 -> correct -> writes bucket 0, bootstraps from bucket 1
         conn = drl_scorer._tracker._get_conn()
         rows = conn.execute(
-            "SELECT streak_bucket, q_value FROM drl_qtable ORDER BY streak_bucket"
+            f"SELECT streak_bucket, {AVG_Q} AS avg_q FROM drl_qtable ORDER BY streak_bucket"
         ).fetchall()
         assert len(rows) == len(SOURCES)
         for r in rows:
-            # First update: Q = lr * (r + gamma*0 - 0) = lr * 1.0 > 0
-            assert r["q_value"] > 0
+            # First update lands on ONE estimator: avg = lr * 1.0 / 2 > 0
+            assert r["avg_q"] > 0
             assert r["streak_bucket"] == 0
 
     def test_self_transition_bootstraps_from_current_estimate(self, drl_scorer):
@@ -572,12 +574,13 @@ class TestTD0Bootstrap:
         # Correct call from bucket 0 -> bootstraps from seeded bucket 1
         self._record(drl_scorer)
         rows = conn.execute(
-            "SELECT q_value FROM drl_qtable WHERE streak_bucket = 0"
+            f"SELECT {AVG_Q} AS avg_q FROM drl_qtable WHERE streak_bucket = 0"
         ).fetchall()
-        # Q = 0 + lr * (1 + gamma*0.5 - 0) = lr * 1.45 > lr * 1.0 (degenerate EMA)
-        degenerate = lr * 1.0
+        # One estimator moves: avg = lr * (1 + gamma*0.5) / 2, still strictly
+        # above the degenerate EMA average lr * 1.0 / 2.
+        degenerate = lr * 1.0 / 2.0
         for r in rows:
-            assert r["q_value"] > degenerate + 1e-9
+            assert r["avg_q"] > degenerate + 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -620,12 +623,14 @@ class TestAdaptiveLRDecay:
         )
         conn = drl_scorer._tracker._get_conn()
         rows = conn.execute(
-            "SELECT q_value, visit_count FROM drl_qtable WHERE regime_bucket='neutral'"
+            "SELECT visit_count, " + AVG_Q + " AS avg_q FROM drl_qtable "
+            "WHERE regime_bucket='neutral'"
         ).fetchall()
         for row in rows:
             # First visit: e=1, lr=lr_0=0.15, gamma=0.9, next_q=0 for fresh
-            # next bucket -> q = 0 + 0.15 * (1 + 0.9*0 - 0) = 0.15
-            assert row["q_value"] == pytest.approx(0.15)
+            # next bucket -> one estimator gets 0.15, the deployed average
+            # gets 0.15/2 = 0.075.
+            assert row["avg_q"] == pytest.approx(0.075)
             assert row["visit_count"] == 1
 
     def test_mature_state_smaller_steps(self, drl_scorer):
@@ -648,12 +653,12 @@ class TestAdaptiveLRDecay:
             )
             conn = drl_scorer._tracker._get_conn()
             row = conn.execute(
-                "SELECT q_value FROM drl_qtable "
+                "SELECT " + AVG_Q + " AS avg_q FROM drl_qtable "
                 "WHERE regime_bucket='neutral' AND source='trader' AND streak_bucket=?",
                 (bucket,),
             ).fetchone()
             assert row is not None, f"bucket {bucket} missing after round {i}"
-            q_at[i] = row["q_value"]
+            q_at[i] = row["avg_q"]
         early_gap = abs(q_at[2] - q_at[1])
         late_gap = abs(q_at[20] - q_at[19])
         assert late_gap < early_gap, (
@@ -683,9 +688,10 @@ class TestAdaptiveLRDecay:
             )
         conn = drl_scorer._tracker._get_conn()
         rows = conn.execute(
-            "SELECT source, q_value FROM drl_qtable WHERE regime_bucket='neutral'"
+            "SELECT source, " + AVG_Q + " AS avg_q FROM drl_qtable "
+            "WHERE regime_bucket='neutral'"
         ).fetchall()
-        by_src = {r["source"]: r["q_value"] for r in rows}
+        by_src = {r["source"]: r["avg_q"] for r in rows}
         assert by_src["trader"] > 0, "consistently-correct rounds should drive Q up"
 
     def test_migration_adds_visit_count_to_legacy_db(self, tmp_path):
@@ -1107,6 +1113,12 @@ class TestSelfPlayGate:
 from tradingagents.graph.consensus import DRL_TRACE_LAMBDA
 
 
+# Deployed double-Q value: the (Q_A + Q_B)/2 average is what record_reward
+# writes into weights and what deterministic tests must assert (each update
+# lands on exactly ONE estimator, so the average moves by lr*delta/2).
+AVG_Q = "(q_value + q_value_b) / 2.0"
+
+
 class TestTDLambdaEligibility:
     """Watkins Q(lambda) with replacing traces on the DRL Q-table."""
 
@@ -1132,25 +1144,49 @@ class TestTDLambdaEligibility:
             return (None, None, None)
         return (row["q_value"], row["eligibility"], row["visit_count"])
 
+    def _avg_q(self, drl_scorer, source, bucket, regime="neutral"):
+        conn = drl_scorer._tracker._get_conn()
+        row = conn.execute(
+            "SELECT " + AVG_Q + " AS avg_q, eligibility FROM drl_qtable "
+            "WHERE regime_bucket=? AND source=? AND streak_bucket=?",
+            (regime, source, bucket),
+        ).fetchone()
+        if row is None:
+            return (None, None)[0]
+        return row["avg_q"]
+
     def test_lambda_zero_degenerates_to_td0(self, drl_scorer):
         """lambda=0 must reproduce plain TD(0): only the current state updates."""
         drl_scorer.trace_lambda = 0.0
         self._record(drl_scorer)  # streak 0, correct
         conn = drl_scorer._tracker._get_conn()
-        rows = conn.execute("SELECT q_value FROM drl_qtable").fetchall()
+        rows = conn.execute("SELECT " + AVG_Q + " AS avg_q FROM drl_qtable").fetchall()
         assert len(rows) == len(SOURCES)
         for r in rows:
-            # q = 0 + lr*(1 + gamma*0 - 0) = 0.15
-            assert r["q_value"] == pytest.approx(0.15)
+            # one estimator: 0.15; deployed average: 0.15/2 = 0.075
+            assert r["avg_q"] == pytest.approx(0.075)
 
     def test_fresh_state_first_update_matches_td0(self, drl_scorer):
-        """No prior traces anywhere: first update identical to TD(0)."""
+        """No prior traces anywhere: first update identical to TD(0).
+
+        Exactly one estimator receives lr*delta (0.15); the deployed average
+        is half of that.  Eligibility and visit-count semantics are unchanged.
+        """
         self._record(drl_scorer)
+        conn = drl_scorer._tracker._get_conn()
         for src in SOURCES:
-            q, e, n = self._q(drl_scorer, src, 0)
-            assert q == pytest.approx(0.15)
-            assert e == pytest.approx(1.0)
-            assert n == 1
+            row = conn.execute(
+                "SELECT q_value, q_value_b, eligibility, visit_count "
+                "FROM drl_qtable "
+                "WHERE regime_bucket='neutral' AND source=? AND streak_bucket=0",
+                (src,),
+            ).fetchone()
+            bumped = (row["q_value"] != 0.0) + (row["q_value_b"] != 0.0)
+            assert bumped == 1, "exactly one estimator must receive the update"
+            avg = (row["q_value"] + row["q_value_b"]) / 2.0
+            assert avg == pytest.approx(0.075)
+            assert row["eligibility"] == pytest.approx(1.0)
+            assert row["visit_count"] == 1
 
     def test_replacing_traces_bound_eligibility_at_one(self, drl_scorer):
         """Revisiting the same state must cap trace at 1.0 (replacing traces),
@@ -1194,28 +1230,35 @@ class TestTDLambdaEligibility:
                 regime_return=0.01,
             )
             row = conn.execute(
-                "SELECT q_value, eligibility FROM drl_qtable "
+                "SELECT q_value, q_value_b, eligibility FROM drl_qtable "
                 "WHERE regime_bucket='neutral' AND source='trader' "
                 "AND streak_bucket=3"
             ).fetchone()
             # Round decay: e(3) = 0.63^2 * 0.63 = 0.63^3.
             # delta = 1 + gamma*0 - 0 = 1 (fresh bucket 0, next bucket fresh).
-            # Broadcast: q(3) += lr * delta * e(3).
+            # Broadcast lands in ONE estimator: that column gets
+            # lr * delta * e(3); the deployed average gets half of it.
             assert row["eligibility"] == pytest.approx(0.63 ** 3, rel=1e-6)
-            assert row["q_value"] == pytest.approx(
-                scorer.learning_rate * 1.0 * (0.63 ** 3), rel=1e-6
+            avg = (row["q_value"] + row["q_value_b"]) / 2.0
+            assert avg == pytest.approx(
+                scorer.learning_rate * 1.0 * (0.63 ** 3) / 2.0, rel=1e-6
             )
         finally:
             tracker.close()
 
     def test_no_double_apply_to_current_state(self, drl_scorer):
-        """Current state must get exactly lr*delta*1.0 — the upsert must not
-        pre-apply the delta and then broadcast it a second time."""
+        """Current state must get exactly lr*delta*1.0 into ONE estimator —
+        the deployed average must move by lr*delta/2, exactly once."""
         self._record(drl_scorer)
+        conn = drl_scorer._tracker._get_conn()
         for src in SOURCES:
-            q, _, _ = self._q(drl_scorer, src, 0)
-            assert q == pytest.approx(0.15), (
-                "current-state Q must equal lr*delta applied exactly once"
+            row = conn.execute(
+                "SELECT " + AVG_Q + " AS avg_q FROM drl_qtable "
+                "WHERE regime_bucket='neutral' AND source=? AND streak_bucket=0",
+                (src,),
+            ).fetchone()
+            assert row["avg_q"] == pytest.approx(0.075), (
+                "current-state avg Q must equal lr*delta/2 applied exactly once"
             )
 
     def test_backward_propagation_after_visit_sequence(self, drl_scorer):
@@ -1228,7 +1271,7 @@ class TestTDLambdaEligibility:
             ticker="AAPL", date_str="2026-06-10", source_signals=sig,
             predicted_signal="BUY", actual_signal="BUY", regime_return=0.01,
         )
-        q0_r1, _, _ = self._q(drl_scorer, "trader", 0)
+        q0_r1 = self._avg_q(drl_scorer, "trader", 0)
         # Round 2: every source now has 1 correct prediction -> bucket 1.
         for s in SOURCES:
             conn.execute(
@@ -1242,7 +1285,7 @@ class TestTDLambdaEligibility:
             ticker="AAPL", date_str="2026-06-12", source_signals=sig,
             predicted_signal="BUY", actual_signal="BUY", regime_return=0.01,
         )
-        q0_r2, e0_r2, _ = self._q(drl_scorer, "trader", 0)
+        q0_r2, e0_r2 = self._avg_q(drl_scorer, "trader", 0), self._q(drl_scorer, "trader", 0)[1]
         # bucket 0 not revisited: trace decayed 1 -> 0.63, then received
         # lr2 * delta2 * 0.63 with delta2 > 0 (fresh bucket 1, reward +1).
         assert e0_r2 == pytest.approx(0.63), "old trace must decay by gamma*lambda"
@@ -1312,7 +1355,8 @@ class TestTDLambdaEligibility:
                     actual_signal="BUY", regime_return=0.01,
                 )
             row = conn.execute(
-                "SELECT SUM(q_value) AS s FROM drl_qtable WHERE source='trader'"
+                "SELECT SUM((q_value + q_value_b) / 2.0) AS s FROM drl_qtable "
+                "WHERE source='trader'"
             ).fetchone()
             results[lam] = row["s"]
             tracker.close()
@@ -1666,3 +1710,158 @@ class TestResidualBlending:
         weights = scorer.get_blended_weights(signals, regime_return=0.0)
         assert abs(sum(weights.values()) - 1.0) < 1e-3
         assert all(w >= MIN_WEIGHT for w in weights.values())
+# Double-Q bootstrap (van Hasselt 2010) — deploy of stranded
+# E20260816-double-q-bootstrap recomposed onto TD(lambda) + adaptive-LR.
+# ---------------------------------------------------------------------------
+@pytest.mark.usefixtures("drl_scorer")
+class TestDoubleQBootstrap:
+    def test_schema_has_both_estimators(self, drl_scorer):
+        conn = drl_scorer._tracker._get_conn()
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(drl_qtable)").fetchall()]
+        assert "q_value" in cols and "q_value_b" in cols
+
+    def test_record_reward_updates_exactly_one_estimator_per_source(self, drl_scorer):
+        """A single reward must bump exactly one of Q_A/Q_B per source.
+
+        This is the randomised update that makes the two estimators
+        independent noise samples (and cancels the maximization bias).
+        """
+        signals = {src: "BUY" for src in SOURCES}
+        drl_scorer.record_reward(
+            ticker="AAPL", date_str="2026-06-10",
+            source_signals=signals,
+            predicted_signal="BUY", actual_signal="BUY",
+            regime_return=0.01,
+        )
+        conn = drl_scorer._tracker._get_conn()
+        rows = conn.execute("SELECT q_value, q_value_b FROM drl_qtable").fetchall()
+        assert rows, "no Q-table rows written"
+        for row in rows:
+            bumped = (row["q_value"] != 0.0) + (row["q_value_b"] != 0.0)
+            assert bumped == 1, (
+                f"expected exactly one estimator bumped, got Q_A={row['q_value']}, "
+                f"Q_B={row['q_value_b']}"
+            )
+
+    def test_deployed_value_is_averaged_estimator(self, drl_scorer):
+        """Weight adjustments must read the (A+B)/2 average, not one column."""
+        import random as _r
+        _r.seed(11)
+        signals = {src: "BUY" for src in SOURCES}
+        for i in range(30):
+            drl_scorer.record_reward(
+                ticker="AAPL", date_str=f"2026-07-{(i % 28) + 1:02d}",
+                source_signals=signals,
+                predicted_signal="BUY", actual_signal="BUY",
+                regime_return=0.01,
+            )
+        conn = drl_scorer._tracker._get_conn()
+        # Seed a state with asymmetric A/B and check the adjustment math.
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, "
+            "q_value, q_value_b, visit_count, eligibility) "
+            "VALUES ('bull', 'trader', 0, 0.2, 0.6, 1, 0.0) "
+            "ON CONFLICT(regime_bucket, source, streak_bucket) DO NOTHING"
+        )
+        conn.commit()
+        scorer_weights = drl_scorer._get_drl_weight_adjustments("bull", signals)
+        expected = max(
+            -drl_scorer.max_weight_adjust,
+            min(drl_scorer.max_weight_adjust, 0.4 * 0.05),
+        )
+        assert scorer_weights["trader"] == pytest.approx(expected), (
+            f"adjustment must use (A+B)/2=0.4, got {scorer_weights['trader']}"
+        )
+
+    def test_decay_applies_to_both_estimators(self, drl_scorer):
+        conn = drl_scorer._tracker._get_conn()
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value, q_value_b) "
+            "VALUES ('neutral', 'trader', 9, 1.0, 1.0)"
+        )
+        conn.commit()
+        drl_scorer.decay_old_rewards()
+        row = conn.execute(
+            "SELECT q_value, q_value_b FROM drl_qtable WHERE source='trader' AND streak_bucket=9"
+        ).fetchone()
+        import math as _m
+        expected = _m.exp(-DRL_DECAY_LAMBDA)
+        assert row["q_value"] == pytest.approx(expected)
+        assert row["q_value_b"] == pytest.approx(expected)
+
+    def test_reset_zeroes_both_estimators(self, drl_scorer):
+        conn = drl_scorer._tracker._get_conn()
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value, q_value_b) "
+            "VALUES ('neutral', 'trader', 8, 0.7, 0.3)"
+        )
+        conn.commit()
+        drl_scorer.reset_qtable()
+        row = conn.execute(
+            "SELECT q_value, q_value_b FROM drl_qtable WHERE source='trader' AND streak_bucket=8"
+        ).fetchone()
+        assert row["q_value"] == 0.0
+        assert row["q_value_b"] == 0.0
+
+    def test_migrated_db_averages_equal_pre_migration_average(self, tmp_path):
+        """Deployed average unchanged by migration: (0.42 + 0.42)/2 = 0.42."""
+        from tradingagents.graph.consensus import AccuracyTracker
+        dbp = str(tmp_path / "old_schema2.db")
+        conn = sqlite3.connect(dbp)
+        conn.executescript(
+            """
+            CREATE TABLE drl_qtable (
+                regime_bucket   TEXT    NOT NULL,
+                source          TEXT    NOT NULL,
+                streak_bucket   INTEGER NOT NULL,
+                q_value         REAL    NOT NULL DEFAULT 0.0,
+                visit_count     INTEGER NOT NULL DEFAULT 0,
+                eligibility     REAL    NOT NULL DEFAULT 0.0,
+                PRIMARY KEY (regime_bucket, source, streak_bucket)
+            );
+            INSERT INTO drl_qtable VALUES ('neutral', 'trader', 0, 0.42, 3, 0.0);
+            """
+        )
+        conn.commit()
+        conn.close()
+        tracker = AccuracyTracker(db_path=dbp)
+        try:
+            c2 = tracker._get_conn()
+            cols = [r[1] for r in c2.execute("PRAGMA table_info(drl_qtable)").fetchall()]
+            assert "q_value_b" in cols
+            row = c2.execute(
+                "SELECT (q_value + q_value_b) / 2.0 AS avg_q FROM drl_qtable "
+                "WHERE source='trader'"
+            ).fetchone()
+            assert row["avg_q"] == pytest.approx(0.42)
+        finally:
+            tracker.close()
+
+    def test_bias_smoke_noise_only_never_exceeds_reward_bound(self, drl_scorer):
+        """Smoke: with zero true signal, the averaged Q must not ratchet up.
+
+        Under the biased single-max bootstrap, pure noise (zero-mean rewards
+        bootstrapped off a max) can pump Q-values above the achievable
+        reward bound.  The double-Q average must stay near the true value.
+        """
+        import random as _r
+        _r.seed(7)
+        signals = {src: "BUY" for src in SOURCES}
+        # Alternate correct/incorrect: zero-mean reward signal overall
+        for i in range(60):
+            actual = "BUY" if i % 2 == 0 else "SELL"
+            drl_scorer.record_reward(
+                ticker="AAPL", date_str=f"2026-07-{(i % 28) + 1:02d}",
+                source_signals=signals,
+                predicted_signal="BUY", actual_signal=actual,
+                regime_return=0.0,
+            )
+        conn = drl_scorer._tracker._get_conn()
+        rows = conn.execute(
+            "SELECT AVG((q_value + q_value_b) / 2.0) AS avg_q FROM drl_qtable"
+        ).fetchone()
+        # True expected reward is 0; allow generous slack for TD noise but
+        # require it stays well below the +1 pure-reward ceiling.
+        assert rows["avg_q"] < 0.5, (
+            f"averaged Q ratcheted to {rows['avg_q']} under zero-mean rewards"
+        )
