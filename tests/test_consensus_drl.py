@@ -29,6 +29,10 @@ from tradingagents.graph.consensus import (
     WILSON_Z,
     _wilson_lower_bound,
     REPLAY_CONVERGENCE_TOL,
+    PER_ALPHA,
+    PER_BETA,
+    PER_EPS,
+    PER_SAMPLE_FRACTION,
     SOURCES,
 )
 
@@ -1401,3 +1405,170 @@ class TestWilsonLowerBound:
 
     def test_wilson_z_constant_sane(self):
         assert 1.9 < WILSON_Z < 2.0  # 95% confidence
+# Prioritized Experience Replay (H20260905150123, Schaul et al. 2016)
+# ---------------------------------------------------------------------------
+
+import random as _random
+
+
+class TestPrioritizedReplay:
+    """priority=True: rank-based PER with IS correction on the replay loop."""
+
+    def _seed_history(self, tracker, n_rounds=6):
+        """Same seeding helper as TestReplayOptimization."""
+        for i in range(n_rounds):
+            date = f"2026-09-{i+1:02d}"
+            actual = "BUY" if i % 2 == 0 else "SELL"
+            signals = {
+                "investment_judge": "BUY" if i % 3 == 0 else actual,
+                "trader": actual,
+                "risk_judge": "SELL" if actual == "BUY" else "BUY",
+                "portfolio_manager": actual if i % 2 == 0 else "HOLD",
+            }
+            for source, sig in signals.items():
+                tracker.record_prediction("AAPL", date, source, sig)
+            tracker.record_outcome("AAPL", date, actual)
+
+    def test_per_returns_stats_dict(self, drl_scorer):
+        result = drl_scorer.optimize_weights_from_history(priority=True)
+        assert isinstance(result, dict)
+        assert set(result) >= {"epochs", "converged", "final_td_error", "td_error_history"}
+        assert result["epochs"] == 0
+        assert result["converged"] is True
+
+    def test_per_runs_and_updates_qtable(self, tracker, drl_scorer):
+        self._seed_history(tracker, n_rounds=8)
+        result = drl_scorer.optimize_weights_from_history(
+            max_epochs=5, priority=True
+        )
+        assert 1 <= result["epochs"] <= 5
+        assert result["td_error_history"]
+        conn = tracker._get_conn()
+        nonzero = conn.execute(
+            "SELECT COUNT(*) FROM drl_qtable WHERE q_value != 0"
+        ).fetchone()[0]
+        assert nonzero > 0, "PER replay must update the Q-table"
+
+    def test_per_empty_history_no_error(self, drl_scorer):
+        result = drl_scorer.optimize_weights_from_history(priority=True)
+        assert result["final_td_error"] == 0.0
+
+    def test_per_respects_buffer_limit(self, tracker, drl_scorer):
+        self._seed_history(tracker, n_rounds=20)
+        result = drl_scorer.optimize_weights_from_history(
+            max_epochs=3, buffer_limit=8, priority=True
+        )
+        assert result["epochs"] == 3
+        assert len(result["td_error_history"]) == 3
+
+    def test_per_does_not_touch_predictions_table(self, tracker, drl_scorer):
+        self._seed_history(tracker, n_rounds=6)
+        conn = tracker._get_conn()
+        before = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+        drl_scorer.optimize_weights_from_history(max_epochs=3, priority=True)
+        after = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+        assert before == after
+
+    def test_per_deterministic_under_seeded_random(self, tracker, drl_scorer):
+        """Same random seed => identical Q-table after PER replay."""
+        self._seed_history(tracker, n_rounds=8)
+
+        results = []
+        for _ in range(2):
+            drl_scorer.reset_qtable()
+            _random.seed(42)
+            drl_scorer.optimize_weights_from_history(
+                max_epochs=6, priority=True
+            )
+            conn = tracker._get_conn()
+            rows = conn.execute(
+                "SELECT regime_bucket, source, streak_bucket, q_value "
+                "FROM drl_qtable ORDER BY 1, 2, 3"
+            ).fetchall()
+            results.append([tuple(r) for r in rows])
+
+        assert results[0] == results[1], "seeded PER replay must be reproducible"
+
+    def test_per_fixed_point_analytic(self, tracker, drl_scorer):
+        """All-correct history under PER: Q* = r/(1-gamma) = 10.
+
+        IS correction (N*p)^-beta makes prioritised sampling unbiased in
+        expectation, so the same analytic fixed point as uniform replay
+        must emerge.
+        """
+        import math as _math
+
+        for i in range(12):
+            date = f"2026-09-{i+1:02d}"
+            for source in SOURCES:
+                tracker.record_prediction("MSFT", date, source, "BUY")
+            tracker.record_outcome("MSFT", date, "BUY")
+
+        _random.seed(7)
+        result = drl_scorer.optimize_weights_from_history(
+            max_epochs=800, priority=True
+        )
+        assert result["converged"] is True
+        conn = tracker._get_conn()
+        row = conn.execute(
+            "SELECT q_value FROM drl_qtable "
+            "WHERE regime_bucket = 'neutral' AND source = 'trader' "
+            "AND streak_bucket = 4"
+        ).fetchone()
+        expected = 1.0 / (1.0 - drl_scorer.discount_factor)
+        assert row is not None
+        assert _math.isclose(row["q_value"], expected, rel_tol=0.01), (
+            f"PER Q* should be r/(1-gamma)={expected}, got {row['q_value']}"
+        )
+
+    def test_per_fixed_point_wrong_forever(self, tracker, drl_scorer):
+        """All-wrong history under PER: Q* = -1/(1-gamma) = -10."""
+        import math as _math
+
+        for i in range(12):
+            date = f"2026-09-{i+1:02d}"
+            for source in SOURCES:
+                tracker.record_prediction("MSFT", date, source, "SELL")
+            tracker.record_outcome("MSFT", date, "BUY")
+
+        _random.seed(7)
+        result = drl_scorer.optimize_weights_from_history(
+            max_epochs=800, priority=True
+        )
+        assert result["converged"] is True
+        conn = tracker._get_conn()
+        row = conn.execute(
+            "SELECT q_value FROM drl_qtable "
+            "WHERE regime_bucket = 'neutral' AND source = 'trader' "
+            "AND streak_bucket = 0"
+        ).fetchone()
+        expected = -1.0 / (1.0 - drl_scorer.discount_factor)
+        assert row is not None
+        assert _math.isclose(row["q_value"], expected, rel_tol=0.01), (
+            f"PER Q* should be -1/(1-gamma)={expected}, got {row['q_value']}"
+        )
+
+    def test_per_constants_in_range(self):
+        """PER hyperparameters stay within the paper's recommended ranges."""
+        assert 0.0 <= PER_ALPHA <= 1.0
+        assert 0.0 <= PER_BETA <= 1.0
+        assert 0.0 < PER_SAMPLE_FRACTION <= 1.0
+
+    def test_per_is_weight_bounds_effective_lr(self, tracker, drl_scorer):
+        """Normalised IS weights keep per-step |Delta Q| <= lr * max|TD|."""
+        self._seed_history(tracker, n_rounds=10)
+        _random.seed(3)
+        result = drl_scorer.optimize_weights_from_history(
+            max_epochs=3, priority=True
+        )
+        lr = drl_scorer.learning_rate
+        assert result["q_movement_history"], "epochs must run"
+        # Per-step invariant: |Delta Q| = lr*|TD_i|*isw_i with isw <= 1, so
+        # each epoch's max movement <= lr * that epoch's max |TD|.
+        assert "td_max_history" in result, "stats must expose per-epoch max |TD|"
+        for mv, td_max in zip(
+            result["q_movement_history"], result["td_max_history"]
+        ):
+            assert mv <= lr * td_max + 1e-6, (
+                f"movement {mv} exceeds lr*max|TD| bound {lr * td_max}"
+            )
