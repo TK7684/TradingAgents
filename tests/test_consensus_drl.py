@@ -21,6 +21,7 @@ from tradingagents.graph.consensus import (
     _discretize_streak,
     DRL_ALPHA,
     DRL_LEARNING_RATE,
+    DRL_DISCOUNT_FACTOR,
     DRL_DECAY_LAMBDA,
     DRL_MAX_WEIGHT_ADJUST,
     MIN_WEIGHT,
@@ -709,6 +710,115 @@ class TestAdaptiveLRDecay:
 # ---------------------------------------------------------------------------
 # Experience-replay optimisation loop (H20260824150137)
 # ---------------------------------------------------------------------------
+
+class TestReplayDeployIntegration:
+    """Experience-replay deploy: evaluate() replays graded history before scoring.
+
+    (AGI H20260906150126 — RL reward optimization loop deployed into the
+    production evaluate() path.)
+    """
+
+    def _seed_graded_history(self, engine, n_rounds=4):
+        """Seed graded rounds directly into the engine's tracker."""
+        for i in range(n_rounds):
+            date = f"2026-08-{i+1:02d}"
+            actual = "BUY" if i % 2 == 0 else "SELL"
+            signals = {
+                "investment_judge": actual,
+                "trader": actual,
+                "risk_judge": "SELL" if actual == "BUY" else "BUY",
+                "portfolio_manager": actual,
+            }
+            for source, sig in signals.items():
+                engine.tracker.record_prediction("AAPL", date, source, sig)
+            engine.tracker.record_outcome("AAPL", date, actual)
+
+    def _make_log_states(self):
+        return {
+            "2026-09-06": {
+                "company_of_interest": "AAPL",
+                "investment_debate_state": {"judge_decision": "Rating: BUY"},
+                "trader_investment_decision": "FINAL TRANSACTION PROPOSAL: **BUY**",
+                "risk_debate_state": {"judge_decision": "Decision: BUY"},
+                "final_trade_decision": "Rating: BUY",
+            },
+        }
+
+    def test_evaluate_populates_last_replay_stats(self, engine):
+        """DRL-enabled evaluate must run replay and expose its stats."""
+        self._seed_graded_history(engine, n_rounds=4)
+        assert engine.last_replay_stats is None  # not yet run
+        engine.evaluate(self._make_log_states(), use_drl=True)
+        assert engine.last_replay_stats is not None
+        assert engine.last_replay_stats["epochs"] >= 1
+        assert "converged" in engine.last_replay_stats
+
+    def test_evaluate_without_drl_skips_replay(self, engine):
+        """use_drl=False must not run replay."""
+        self._seed_graded_history(engine, n_rounds=4)
+        engine.evaluate({}, use_drl=False)
+        assert engine.last_replay_stats is None
+
+    def test_evaluate_replay_failure_is_non_fatal(self, engine, monkeypatch):
+        """A crashing replay must not break evaluate()."""
+        def _boom(*a, **k):
+            raise RuntimeError("replay exploded")
+
+        monkeypatch.setattr(
+            engine.drl_scorer, "optimize_weights_from_history", _boom
+        )
+        results = engine.evaluate(self._make_log_states(), use_drl=True)
+        assert "2026-09-06" in results
+        assert engine.last_replay_stats is None
+
+    def test_evaluate_replay_updates_qtable_in_production_path(self, engine, db_path):
+        """End-to-end: graded history -> replay inside evaluate -> nonzero Q."""
+        self._seed_graded_history(engine, n_rounds=4)
+        conn = sqlite3.connect(db_path)
+        before = conn.execute(
+            "SELECT COUNT(*) FROM drl_qtable WHERE q_value != 0"
+        ).fetchone()[0]
+        conn.close()
+
+        engine.evaluate(self._make_log_states(), use_drl=True)
+
+        conn = sqlite3.connect(db_path)
+        after = conn.execute(
+            "SELECT COUNT(*) FROM drl_qtable WHERE q_value != 0"
+        ).fetchone()[0]
+        conn.close()
+        assert after > before, "replay inside evaluate() must update the Q-table"
+
+    def test_evaluate_replay_is_contraction_on_re_replay(self, engine, db_path):
+        """Second evaluate() must continue contracting toward the Bellman fixpoint.
+
+        Self-transition bootstrap with gamma=0.9 has fixpoint Q*=r/(1-gamma),
+        so full convergence within REPLAY_MAX_EPOCHS is not guaranteed — but
+        re-replay must be monotonically closer to the fixpoint (smaller final
+        per-pass movement) and Q must respect the Bellman bound
+        |Q| <= r_max/(1-gamma).
+        """
+        self._seed_graded_history(engine, n_rounds=4)
+        engine.evaluate(self._make_log_states(), use_drl=True)
+        stats_1 = dict(engine.last_replay_stats)
+        engine.evaluate(self._make_log_states(), use_drl=True)
+        stats_2 = dict(engine.last_replay_stats)
+
+        assert stats_2["epochs"] <= REPLAY_MAX_EPOCHS
+        mov_1 = stats_1["q_movement_history"][-1]
+        mov_2 = stats_2["q_movement_history"][-1]
+        assert mov_2 <= mov_1, "re-replay must contract, not diverge"
+
+        # Bellman bound: |Q| <= r_max / (1 - gamma)
+        gamma = DRL_DISCOUNT_FACTOR
+        bound = 1.0 / (1.0 - gamma) + 1e-6
+        conn = sqlite3.connect(db_path)
+        max_q = conn.execute(
+            "SELECT MAX(ABS(q_value)) FROM drl_qtable"
+        ).fetchone()[0]
+        conn.close()
+        assert max_q <= bound, f"|Q|={max_q} exceeds Bellman bound {bound}"
+
 
 class TestReplayOptimization:
     """optimize_weights_from_history: RL reward loop over graded predictions."""

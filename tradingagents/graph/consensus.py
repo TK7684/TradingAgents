@@ -1378,6 +1378,10 @@ class ConsensusEngine:
         self.tracker = AccuracyTracker(db_path=db_path)
         self.scorer = ConfidenceScorer(self.tracker)
         self.drl_scorer = DRLWeightedScorer(self.tracker, drl_alpha=drl_alpha)
+        #: Stats from the most recent experience-replay optimisation run
+        #: (see :meth:`DRLWeightedScorer.optimize_weights_from_history`).
+        #: ``None`` until the first DRL-enabled ``evaluate`` call.
+        self.last_replay_stats: Optional[Dict[str, Any]] = None
 
     def evaluate(
         self,
@@ -1400,6 +1404,27 @@ class ConsensusEngine:
         """
         results: Dict[str, ConsensusResult] = {}
         scorer = self.drl_scorer if use_drl else self.scorer
+
+        # Experience-replay deploy (AGI H20260906150126): before scoring,
+        # replay all graded historical predictions through the Q-learning
+        # update so deployed weights reflect everything the system has
+        # learned — not just the single most recent reward.  Runs only when
+        # DRL scoring is active; failures are non-fatal (the current
+        # Q-table is still a valid basis for scoring).
+        if use_drl:
+            try:
+                self.last_replay_stats = self.drl_scorer.optimize_weights_from_history()
+                if self.last_replay_stats.get("epochs", 0):
+                    log.debug(
+                        "Experience replay before scoring: epochs=%s converged=%s",
+                        self.last_replay_stats["epochs"],
+                        self.last_replay_stats["converged"],
+                    )
+            except Exception as exc:
+                self.last_replay_stats = None
+                log.error(
+                    "Experience replay failed (scoring with current Q-table): %s", exc
+                )
 
         for date_str, state in log_states_dict.items():
             try:
