@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import random
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -119,6 +120,20 @@ REPLAY_MAX_EPOCHS: int = 50
 REPLAY_CONVERGENCE_TOL: float = 1e-4
 #: Max graded predictions replayed per call (most recent first).
 REPLAY_BUFFER_LIMIT: int = 500
+
+# Self-Play Gate (arxiv:2609.04697 self-play, applied to forward-gating):
+# A candidate weight vector must win a tournament against epsilon-perturbed
+# copies of itself (and of the accuracy baseline) rather than a single
+# deterministic comparison on one small window. Tournament-averaged scores
+# suppress small-sample "lucky window" overfitting: a candidate that only
+# wins by knife-edge on the exact recorded history collapses under noise,
+# while a genuine-margin candidate survives every perturbed copy.
+#: Number of epsilon-perturbed sparring copies per side.
+SELFPLAY_N_OPPONENTS: int = 7
+#: Perturbation scale applied to weights (relative noise).
+SELFPLAY_EPSILON: float = 0.10
+#: Deterministic seed (tournament must be reproducible run-to-run).
+SELFPLAY_SEED: int = 42
 
 # ---------------------------------------------------------------------------
 # Regex patterns (mirrors signal_processing.py)
@@ -904,10 +919,14 @@ class DRLWeightedScorer:
     ) -> Dict[str, float]:
         """Forward-gated weight deployment (paper: "Train Often, Deploy Selectively").
 
-        Compares *blended_weights* against *accuracy_weights* by simulating
-        weighted-vote consensus on recent graded predictions.  If accuracy-only
-        weights produce fewer incorrect signals, the DRL component is gated off
-        for this cycle and accuracy weights are returned instead.
+        Compares *blended_weights* against *accuracy_weights* via a
+        self-play tournament: each side's round-win rate is averaged over
+        itself plus ``SELFPLAY_N_OPPONENTS`` epsilon-perturbed copies
+        (deterministic seed), so a candidate that only wins by knife-edge
+        margins on the exact recorded window collapses under noise while a
+        genuine-margin candidate survives.  If the accuracy side wins the
+        tournament on average, the DRL component is gated off for this cycle
+        and accuracy weights are returned instead.
 
         This prevents a degenerating Q-table from dragging down performance —
         the DRL weights must *earn* deployment by winning on a forward check.
@@ -936,44 +955,106 @@ class DRLWeightedScorer:
         # We approximate "evaluation rounds" as groups of 4 (one per source).
         rounds = [rows[i:i + len(SOURCES)] for i in range(0, len(rows) - len(SOURCES) + 1, len(SOURCES))]
 
-        acc_score = 0  # how often accuracy-weights pick the right consensus
-        drl_score = 0
+        rounds = [g for g in rounds if len(g) >= 2]
+        acc_mean, drl_mean = self._selfplay_tournament(
+            accuracy_weights, blended_weights, rounds
+        )
 
-        for group in rounds:
-            if len(group) < 2:
-                continue
-            # Build weighted vote for each weight set
-            for weights, score_ref in [(accuracy_weights, "acc"), (blended_weights, "drl")]:
-                vote = {"BUY": 0.0, "HOLD": 0.0, "SELL": 0.0}
-                actuals = set()
-                for row in group:
-                    src = row["source"]
-                    pred = row["predicted_signal"]
-                    actual = row["actual_signal"]
-                    w = weights.get(src, 0.25)
-                    if pred in vote:
-                        vote[pred] += w
-                    actuals.add(actual)
-                consensus = max(vote, key=vote.get)
-                # Score: did the weighted consensus match any actual?
-                if consensus in actuals:
-                    if score_ref == "acc":
-                        acc_score += 1
-                    else:
-                        drl_score += 1
-
-        if acc_score > drl_score:
+        if acc_mean > drl_mean:
             log.info(
-                "Forward-Gate: BLOCKED DRL weights (acc=%d vs drl=%d on %d rounds) — deploying accuracy-only",
-                acc_score, drl_score, len(rounds),
+                "Self-Play Gate: BLOCKED DRL weights (acc=%.3f vs drl=%.3f over "
+                "%d rounds x %d perturbed opponents) — deploying accuracy-only",
+                acc_mean, drl_mean, len(rounds), SELFPLAY_N_OPPONENTS,
             )
             return accuracy_weights
 
         log.debug(
-            "Forward-Gate: PASSED (acc=%d vs drl=%d) — deploying blended",
-            acc_score, drl_score,
+            "Self-Play Gate: PASSED (acc=%.3f vs drl=%.3f) — deploying blended",
+            acc_mean, drl_mean,
         )
         return blended_weights
+
+    def _score_rounds(
+        self,
+        weights: Dict[str, float],
+        rounds: list,
+    ) -> int:
+        """Weighted-vote consensus win count for *weights* over *rounds*."""
+        score = 0
+        for group in rounds:
+            vote = {"BUY": 0.0, "HOLD": 0.0, "SELL": 0.0}
+            actuals = set()
+            for row in group:
+                src = row["source"]
+                pred = row["predicted_signal"]
+                actual = row["actual_signal"]
+                w = weights.get(src, 0.25)
+                if pred in vote:
+                    vote[pred] += w
+                actuals.add(actual)
+            consensus = max(vote, key=vote.get)
+            if consensus in actuals:
+                score += 1
+        return score
+
+    def _perturb(
+        self,
+        weights: Dict[str, float],
+        rng: random.Random,
+    ) -> Dict[str, float]:
+        """Epsilon-perturbed, renormalised copy of *weights* (a sparring partner).
+
+        Each source weight is scaled by ``1 + U(-SELFPLAY_EPSILON,
+        +SELFPLAY_EPSILON)``, clamped at :data:`MIN_WEIGHT`, then the vector is
+        renormalised to sum to 1 so every sparring copy is a valid weight dict.
+        """
+        perturbed: Dict[str, float] = {}
+        for src in SOURCES:
+            w = weights.get(src, 1.0 / len(SOURCES))
+            perturbed[src] = max(
+                MIN_WEIGHT,
+                w * (1.0 + rng.uniform(-SELFPLAY_EPSILON, SELFPLAY_EPSILON)),
+            )
+        total = sum(perturbed.values())
+        if total <= 0:
+            equal = 1.0 / len(SOURCES)
+            return {src: equal for src in SOURCES}
+        return {src: w / total for src, w in perturbed.items()}
+
+    def _selfplay_tournament(
+        self,
+        accuracy_weights: Dict[str, float],
+        blended_weights: Dict[str, float],
+        rounds: list,
+    ) -> Tuple[float, float]:
+        """Self-play tournament between the two candidate weight vectors.
+
+        Each side plays the recorded *rounds* as itself plus
+        ``SELFPLAY_N_OPPONENTS`` epsilon-perturbed copies of itself; the
+        side's tournament score is the mean round-win rate across all its
+        players.  Averaging over perturbed copies demotes knife-edge wins
+        (which flip under ~10% noise) and keeps robust wins — the
+        small-sample-overfitting fix this gate exists to provide.
+
+        The RNG is seeded from :data:`SELFPLAY_SEED` on every call, so the
+        tournament is fully deterministic and reproducible run-to-run.
+
+        Returns:
+            ``(accuracy_mean, blended_mean)`` round-win rates.
+        """
+        rng = random.Random(SELFPLAY_SEED)
+        acc_scores = [self._score_rounds(accuracy_weights, rounds)]
+        drl_scores = [self._score_rounds(blended_weights, rounds)]
+        for _ in range(SELFPLAY_N_OPPONENTS):
+            acc_scores.append(
+                self._score_rounds(self._perturb(accuracy_weights, rng), rounds)
+            )
+            drl_scores.append(
+                self._score_rounds(self._perturb(blended_weights, rng), rounds)
+            )
+        acc_mean = sum(acc_scores) / len(acc_scores)
+        drl_mean = sum(drl_scores) / len(drl_scores)
+        return acc_mean, drl_mean
 
     def record_reward(
         self,
