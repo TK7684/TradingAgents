@@ -57,8 +57,10 @@ def run_daily(tickers, profile="turbo"):
         from tradingagents.tv_screener.client import TVScreener
         from tradingagents.tv_screener.briefing import format_discord_briefing
         tv = TVScreener()
-        # Build sectors dict from the tickers being analyzed
-        sectors = {"watchlist": tickers}
+        # Build sectors dict: watchlist + ETF REGIME sector (SPY/QQQ/IWM/DIA).
+        # The ETF data drives format_market_regime_block() — the index-regime
+        # context that stops the LLM agents from buying into index selloffs.
+        sectors = {"watchlist": tickers, "etf": ["SPY", "QQQ", "IWM", "DIA"]}
         tv_briefing = tv.get_pre_market_watchlist(sectors=sectors)
         # Print briefing summary to console
         print(format_discord_briefing(tv_briefing))

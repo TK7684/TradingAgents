@@ -103,6 +103,65 @@ def format_discord_briefing(briefing: dict) -> str:
     return "\n".join(lines)
 
 
+def format_market_regime_block(briefing: dict) -> str:
+    """Format a compact SPY/QQQ/sector-ETF regime block for LLM prompts.
+
+    Purpose: give every TradingAgents debate an explicit INDEX REGIME context so
+    agents stop recommending buys into index-wide selloffs (June 2026 failure
+    class: 6/7 stop-losses were buys made while SPY sat below its 20d MA).
+    Reads SPY/QQQ/IWM/DIA from the briefing's watchlist data (ETF sector is
+    part of get_pre_market_watchlist default sectors).
+
+    Returns empty string when ETF data is absent (behavior unchanged).
+    """
+    wl = (briefing or {}).get("watchlist_data", {})
+    if not wl:
+        return ""
+
+    def _regime(sym: str) -> tuple[str, str] | None:
+        d = wl.get(sym)
+        if not d:
+            return None
+        close = d.get("close") or 0
+        sma50 = d.get("SMA50")
+        sma200 = d.get("SMA200")
+        rsi = d.get("RSI")
+        rec = d.get("Recommend.All", 0)
+        if not close:
+            return None
+        # Trend verdict from moving averages when available
+        if sma50 and sma200:
+            if close > sma50 > sma200:
+                trend = "UPTREND (price>SMA50>SMA200)"
+            elif close < sma50 < sma200:
+                trend = "DOWNTREND (price<SMA50<SMA200)"
+            elif close < sma200:
+                trend = "WEAK (price below SMA200)"
+            else:
+                trend = "MIXED (between MAs)"
+        else:
+            trend = "N/A"
+        rsi_str = f"{rsi:.1f}" if rsi else "N/A"
+        rec_str = ("BUY" if rec > 0.4 else "SELL" if rec < -0.2 else "HOLD")
+        return trend, f"RSI:{rsi_str} TVrec:{rec_str}"
+
+    lines = ["", "📈 INDEX REGIME (TradingView, real-time):"]
+    any_line = False
+    for sym in ("SPY", "QQQ", "IWM", "DIA"):
+        r = _regime(sym)
+        if r:
+            trend, extra = r
+            lines.append(f"   {sym}: {trend} | {extra}")
+            any_line = True
+    if not any_line:
+        return ""
+    lines.append(
+        "   RULE: When SPY is in DOWNTREND/WEAK, demand materially stronger "
+        "conviction for BUY theses; bias exits and tighten stops on holds."
+    )
+    return "\n".join(lines)
+
+
 def format_market_context_for_llm(briefing: dict, ticker_symbol: str = None) -> str:
     """Format TradingView briefing data into a compact text section for LLM prompt injection.
 
@@ -124,6 +183,11 @@ def format_market_context_for_llm(briefing: dict, ticker_symbol: str = None) -> 
     lines.append("=" * 60)
     lines.append("REAL-TIME MARKET CONTEXT (TradingView Screener)")
     lines.append("=" * 60)
+
+    # Index regime block (SPY/QQQ) — prevents buying into index-wide selloffs
+    regime_block = format_market_regime_block(briefing)
+    if regime_block:
+        lines.append(regime_block)
 
     # Market breadth
     b = briefing.get("market_breadth", {})
