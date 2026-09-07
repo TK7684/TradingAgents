@@ -115,8 +115,56 @@ class TVScreener:
             except Exception as e:
                 logger.warning("Could not load Chrome cookies, using delayed data: %s", e)
                 self._cookies = None
+            if self._cookies is None:
+                self._cookies = self._load_vault_cookies()
         else:
             self._cookies = cookies
+
+    @staticmethod
+    def _load_vault_cookies():
+        """Load TradingView cookies from the Hermes cookie vault (CDP-harvested).
+
+        Vault path: ~/.hermes/bounty-auth/vault/tradingview.com.json
+        Returns a CookieJar, or None if the vault record is missing/expired.
+        """
+        import json as _json
+        import time as _time
+        from http.cookiejar import CookieJar, Cookie as JarCookie
+        from pathlib import Path as _Path
+
+        vault = _Path.home() / ".hermes/bounty-auth/vault/tradingview.com.json"
+        try:
+            rec = _json.loads(vault.read_text())
+            cookies = rec.get("cookies", []) if isinstance(rec, dict) else rec
+            jar = CookieJar()
+            now = _time.time()
+            count = 0
+            for c in cookies:
+                if not c.get("name") or not c.get("value"):
+                    continue
+                expires = c.get("expires") or c.get("expirationDate") or now + 86400 * 30
+                if expires < now:
+                    continue
+                jar.set_cookie(JarCookie(
+                    version=0, name=c["name"], value=c["value"],
+                    port=None, port_specified=False,
+                    domain=c.get("domain", ".tradingview.com"),
+                    domain_specified=True, domain_initial_dot=c.get("domain", ".").startswith("."),
+                    path=c.get("path", "/"), path_specified=True,
+                    secure=c.get("secure", True),
+                    expires=int(expires),
+                    discard=False, comment=None, comment_url=None, rest={}, rfc2109=False,
+                ))
+                count += 1
+            if count >= 3:
+                logger.info("TradingView cookies loaded from vault (%d cookies)", count)
+                return jar
+            logger.warning("Vault tradingview.com.json has only %d valid cookies — ignoring", count)
+        except FileNotFoundError:
+            logger.info("No vault tradingview.com.json — delayed data")
+        except Exception as e:
+            logger.warning("Vault cookie load failed: %s", e)
+        return None
 
     @property
     def has_realtime(self) -> bool:
