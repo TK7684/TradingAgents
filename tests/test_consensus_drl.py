@@ -984,3 +984,107 @@ class TestReplayOptimization:
         result = drl_scorer.optimize_weights_from_history()
         assert result["final_td_error"] == 0.0
         drl_scorer.reset_qtable()  # still works after replay
+
+# ---------------------------------------------------------------------------
+# Self-Play Gate Tests (AGI cycle H20260907150301)
+# ---------------------------------------------------------------------------
+
+class TestSelfPlayGate:
+    """Self-play tournament gate (arxiv:2609.04697 applied to forward-gating).
+
+    The candidate weight vector must beat the accuracy baseline over a
+    tournament of epsilon-perturbed copies, not a single deterministic
+    comparison — the fix for small-sample overfitting on one window.
+    """
+
+    def test_tournament_is_deterministic(self, tracker, drl_scorer):
+        """Same inputs -> identical tournament scores (seeded RNG)."""
+        rounds = [[{"source": s, "predicted_signal": "BUY", "actual_signal": "BUY"}
+                   for s in SOURCES] for _ in range(6)]
+        w1 = drl_scorer._selfplay_tournament({"a": 0.9}, {"b": 0.9}, rounds)
+        w2 = drl_scorer._selfplay_tournament({"a": 0.9}, {"b": 0.9}, rounds)
+        assert w1 == w2
+
+    def test_perturb_returns_valid_weight_dict(self, drl_scorer):
+        """Perturbed copies stay normalised and above MIN_WEIGHT."""
+        import random
+        rng = random.Random(0)
+        weights = {s: 0.25 for s in SOURCES}
+        for _ in range(50):
+            p = drl_scorer._perturb(weights, rng)
+            assert set(p.keys()) == set(SOURCES)
+            assert abs(sum(p.values()) - 1.0) < 1e-9
+            assert all(w >= MIN_WEIGHT for w in p.values())
+
+    def test_unanimous_rounds_robust_to_noise(self, drl_scorer):
+        """Unanimous-correct rounds: every perturbed copy wins the round."""
+        rounds = [[{"source": s, "predicted_signal": "BUY", "actual_signal": "BUY"}
+                   for s in SOURCES] for _ in range(6)]
+        acc_mean, drl_mean = drl_scorer._selfplay_tournament(
+            {s: 0.25 for s in SOURCES}, {s: 0.25 for s in SOURCES}, rounds)
+        assert acc_mean == drl_mean == 6.0
+
+    def test_genuine_margin_survives_perturbation(self, drl_scorer):
+        """A candidate with a real winning margin keeps winning under noise.
+
+        Actual is always SELL; two always-wrong sources shout BUY, one
+        always-right source says SELL. Equal weights drown the right source
+        (BUY=0.5 beats SELL=0.25), so the baseline loses every round; a
+        candidate weighting the right source at 0.55 wins every round, and
+        +-10% relative noise cannot flip either side's consensus.
+        """
+        rounds = [
+            [
+                {"source": "investment_judge", "predicted_signal": "BUY", "actual_signal": "SELL"},
+                {"source": "trader", "predicted_signal": "BUY", "actual_signal": "SELL"},
+                {"source": "risk_judge", "predicted_signal": "SELL", "actual_signal": "SELL"},
+                {"source": "portfolio_manager", "predicted_signal": "HOLD", "actual_signal": "SELL"},
+            ]
+            for _ in range(6)
+        ]
+        candidate = {"investment_judge": 0.15, "trader": 0.15,
+                     "risk_judge": 0.55, "portfolio_manager": 0.15}
+        baseline = {s: 0.25 for s in SOURCES}
+        acc_mean, drl_mean = drl_scorer._selfplay_tournament(
+            baseline, candidate, rounds)
+        assert drl_mean > acc_mean
+        assert drl_mean == 6.0, "robust candidate must win every round"
+        assert acc_mean == 0.0, "equal weights drown the only correct source"
+
+    def test_gate_blocks_degenerate_drl_via_tournament(self, tracker):
+        """Degenerate Q-table boosting an always-wrong source is still blocked.
+
+        Mirrors test_forward_gate_blocks_degenerate_drl but exercising the
+        self-play tournament path end-to-end: Q-table boosts the always-wrong
+        source (investment_judge=BUY) and suppresses the always-right one
+        (risk_judge=SELL); the tournament must still fall back to accuracy
+        weights.
+        """
+        scorer = DRLWeightedScorer(tracker, drl_alpha=1.0)
+        for i in range(6):
+            date = f"2026-06-{10+i:02d}"
+            tracker.record_prediction("TEST", date, "investment_judge", "BUY")
+            tracker.record_prediction("TEST", date, "trader", "BUY")
+            tracker.record_prediction("TEST", date, "risk_judge", "SELL")
+            tracker.record_prediction("TEST", date, "portfolio_manager", "HOLD")
+            tracker.record_outcome("TEST", date, "SELL")
+
+        conn = tracker._get_conn()
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+            "VALUES ('neutral', 'investment_judge', 0, 1.0)"
+        )
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+            "VALUES ('neutral', 'risk_judge', 0, -1.0)"
+        )
+        conn.commit()
+
+        signals = {"investment_judge": "BUY", "trader": "BUY",
+                    "risk_judge": "SELL", "portfolio_manager": "HOLD"}
+        weights = scorer.get_blended_weights(signals, regime_return=0.0)
+
+        acc_weights = tracker.get_weights()
+        for src in SOURCES:
+            assert abs(weights[src] - acc_weights[src]) < 1e-3, \
+                f"Self-play gate should have blocked DRL for {src}: got {weights[src]}, expected {acc_weights[src]}"
