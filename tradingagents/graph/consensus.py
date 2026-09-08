@@ -97,6 +97,11 @@ DRL_ALPHA: float = 0.3
 DRL_LEARNING_RATE: float = 0.15
 DRL_DISCOUNT_FACTOR: float = 0.9
 DRL_DECAY_LAMBDA: float = 0.07
+
+#: TD(lambda) eligibility-trace decay (Watkins Q(lambda), replacing traces).
+#: Credit for one TD error propagates to recently visited state-actions at
+#: weight (gamma*lambda)^k; lambda=0 degenerates to pure TD(0).
+DRL_TRACE_LAMBDA: float = 0.7
 DRL_MAX_WEIGHT_ADJUST: float = 0.15
 
 #: Per-state visit-count adaptive LR decay: lr_n = lr_0 / (1 + n * lr_decay).
@@ -380,6 +385,7 @@ class AccuracyTracker:
             streak_bucket   INTEGER NOT NULL,
             q_value         REAL    NOT NULL DEFAULT 0.0,
             visit_count     INTEGER NOT NULL DEFAULT 0,
+            eligibility     REAL    NOT NULL DEFAULT 0.0,
             PRIMARY KEY (regime_bucket, source, streak_bucket)
         );
     """
@@ -415,6 +421,14 @@ class AccuracyTracker:
         try:
             conn.execute(
                 "ALTER TABLE drl_qtable ADD COLUMN visit_count INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Migration: TD(lambda) eligibility traces (H20260830150558 deploy of
+        # stranded a6e5be4) added the eligibility column the same way.
+        try:
+            conn.execute(
+                "ALTER TABLE drl_qtable ADD COLUMN eligibility REAL NOT NULL DEFAULT 0.0"
             )
         except sqlite3.OperationalError:
             pass  # column already exists
@@ -814,6 +828,7 @@ class DRLWeightedScorer:
         decay_lambda: float = DRL_DECAY_LAMBDA,
         max_weight_adjust: float = DRL_MAX_WEIGHT_ADJUST,
         lr_decay: float = DRL_LR_DECAY,
+        trace_lambda: float = DRL_TRACE_LAMBDA,
     ):
         self._tracker = accuracy_tracker
         self._base_scorer = ConfidenceScorer(accuracy_tracker)
@@ -823,6 +838,7 @@ class DRLWeightedScorer:
         self.decay_lambda = decay_lambda
         self.max_weight_adjust = max_weight_adjust
         self.lr_decay = lr_decay
+        self.trace_lambda = trace_lambda
 
     # -- public interface ------------------------------------------------------
 
@@ -1143,14 +1159,34 @@ class DRLWeightedScorer:
                 min(self.max_weight_adjust, new_q * 0.05),
             )
 
-            # Upsert Q-table
+            # TD(lambda) eligibility traces (deploy of stranded experiment
+            # a6e5be4, recomposed onto the TD(0)-bootstrap + adaptive-LR
+            # lineage). Replacing traces (Watkins Q(lambda)):
+            #   1. decay this source's traces by gamma * lambda
+            #   2. current state-action's trace := 1.0 (replaces, bounds e<=1)
+            #   3. broadcast the TD delta to every state in proportion to its
+            #      trace, so multi-step credit assignment reaches the states
+            #      that led here instead of only the terminal one.
+            trace_decay = self.discount_factor * self.trace_lambda
             conn.execute(
-                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value, visit_count) "
-                "VALUES (?, ?, ?, ?, 1) "
+                "UPDATE drl_qtable SET eligibility = eligibility * ? "
+                "WHERE source = ? AND eligibility != 0",
+                (trace_decay, source),
+            )
+            conn.execute(
+                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, "
+                "q_value, visit_count, eligibility) "
+                "VALUES (?, ?, ?, ?, 1, 1.0) "
                 "ON CONFLICT(regime_bucket, source, streak_bucket) "
-                "DO UPDATE SET q_value = excluded.q_value, "
-                "visit_count = visit_count + 1",
-                (regime_bucket, source, streak_bucket, new_q),
+                "DO UPDATE SET q_value = drl_qtable.q_value, "
+                "visit_count = drl_qtable.visit_count + 1, "
+                "eligibility = 1.0",
+                (regime_bucket, source, streak_bucket, old_q),
+            )
+            conn.execute(
+                "UPDATE drl_qtable SET q_value = q_value + ? * eligibility "
+                "WHERE source = ? AND eligibility != 0",
+                (effective_lr * td_error, source),
             )
 
             # Record reward history
@@ -1389,9 +1425,9 @@ class DRLWeightedScorer:
         return cursor.rowcount
 
     def reset_qtable(self) -> None:
-        """Reset all Q-values to 0 (for testing)."""
+        """Reset all Q-values and eligibility traces to 0 (for testing)."""
         conn = self._tracker._get_conn()
-        conn.execute("UPDATE drl_qtable SET q_value = 0.0")
+        conn.execute("UPDATE drl_qtable SET q_value = 0.0, eligibility = 0.0")
         conn.commit()
 
     # -- private helpers ------------------------------------------------------

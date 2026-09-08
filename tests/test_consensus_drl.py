@@ -1088,3 +1088,252 @@ class TestSelfPlayGate:
         for src in SOURCES:
             assert abs(weights[src] - acc_weights[src]) < 1e-3, \
                 f"Self-play gate should have blocked DRL for {src}: got {weights[src]}, expected {acc_weights[src]}"
+# TD(lambda) eligibility traces (AGI cycle H20260830150558 — deploy of
+# stranded a6e5be4/55ca3a9, recomposed onto TD(0)-bootstrap + adaptive-LR)
+# ---------------------------------------------------------------------------
+
+from tradingagents.graph.consensus import DRL_TRACE_LAMBDA
+
+
+class TestTDLambdaEligibility:
+    """Watkins Q(lambda) with replacing traces on the DRL Q-table."""
+
+    def _record(self, drl_scorer, **kw):
+        signals = kw.get("signals", {src: "BUY" for src in SOURCES})
+        drl_scorer.record_reward(
+            ticker=kw.get("ticker", "AAPL"),
+            date_str=kw.get("date_str", "2026-06-10"),
+            source_signals=signals,
+            predicted_signal=kw.get("predicted_signal", "BUY"),
+            actual_signal=kw.get("actual_signal", "BUY"),
+            regime_return=kw.get("regime_return", 0.01),
+        )
+
+    def _q(self, drl_scorer, source, bucket, regime="neutral"):
+        conn = drl_scorer._tracker._get_conn()
+        row = conn.execute(
+            "SELECT q_value, eligibility, visit_count FROM drl_qtable "
+            "WHERE regime_bucket=? AND source=? AND streak_bucket=?",
+            (regime, source, bucket),
+        ).fetchone()
+        if row is None:
+            return (None, None, None)
+        return (row["q_value"], row["eligibility"], row["visit_count"])
+
+    def test_lambda_zero_degenerates_to_td0(self, drl_scorer):
+        """lambda=0 must reproduce plain TD(0): only the current state updates."""
+        drl_scorer.trace_lambda = 0.0
+        self._record(drl_scorer)  # streak 0, correct
+        conn = drl_scorer._tracker._get_conn()
+        rows = conn.execute("SELECT q_value FROM drl_qtable").fetchall()
+        assert len(rows) == len(SOURCES)
+        for r in rows:
+            # q = 0 + lr*(1 + gamma*0 - 0) = 0.15
+            assert r["q_value"] == pytest.approx(0.15)
+
+    def test_fresh_state_first_update_matches_td0(self, drl_scorer):
+        """No prior traces anywhere: first update identical to TD(0)."""
+        self._record(drl_scorer)
+        for src in SOURCES:
+            q, e, n = self._q(drl_scorer, src, 0)
+            assert q == pytest.approx(0.15)
+            assert e == pytest.approx(1.0)
+            assert n == 1
+
+    def test_replacing_traces_bound_eligibility_at_one(self, drl_scorer):
+        """Revisiting the same state must cap trace at 1.0 (replacing traces),
+        not accumulate 1 + decay + ... (accumulating traces)."""
+        signals = {src: "BUY" for src in SOURCES}
+        for i in range(4):
+            # predicted BUY vs actual SELL -> reward -1, streak stays 0
+            drl_scorer.record_reward(
+                ticker="AAPL", date_str=f"2026-06-1{i}",
+                source_signals=signals,
+                predicted_signal="BUY", actual_signal="SELL",
+                regime_return=0.01,
+            )
+        for src in SOURCES:
+            q, e, n = self._q(drl_scorer, src, 0)
+            assert e == pytest.approx(1.0), "replacing traces must cap e at 1.0"
+            assert n == 4
+
+    def test_multi_step_credit_propagates_to_prior_states(self, tmp_path):
+        """The delta broadcast must reach state-actions visited *before* the
+        reward arrived, weighted by their (gamma*lambda)^k trace."""
+        from tradingagents.graph.consensus import DRLWeightedScorer, AccuracyTracker
+        tracker = AccuracyTracker(db_path=str(tmp_path / "t.db"))
+        scorer = DRLWeightedScorer(tracker)
+        conn = tracker._get_conn()
+        try:
+            # Seed: 'trader' visited bucket 3 two rounds ago; its trace has
+            # decayed twice since (no revisits). gamma*lambda = 0.9*0.7 = 0.63.
+            conn.execute(
+                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, "
+                "q_value, visit_count, eligibility) "
+                "VALUES ('neutral', 'trader', 3, 0.0, 1, 0.63 * 0.63)"
+            )
+            conn.commit()
+            # Current event: trader in bucket 0, correct consensus (reward +1).
+            signals = {src: "BUY" for src in SOURCES}
+            scorer.record_reward(
+                ticker="AAPL", date_str="2026-06-10",
+                source_signals=signals,
+                predicted_signal="BUY", actual_signal="BUY",
+                regime_return=0.01,
+            )
+            row = conn.execute(
+                "SELECT q_value, eligibility FROM drl_qtable "
+                "WHERE regime_bucket='neutral' AND source='trader' "
+                "AND streak_bucket=3"
+            ).fetchone()
+            # Round decay: e(3) = 0.63^2 * 0.63 = 0.63^3.
+            # delta = 1 + gamma*0 - 0 = 1 (fresh bucket 0, next bucket fresh).
+            # Broadcast: q(3) += lr * delta * e(3).
+            assert row["eligibility"] == pytest.approx(0.63 ** 3, rel=1e-6)
+            assert row["q_value"] == pytest.approx(
+                scorer.learning_rate * 1.0 * (0.63 ** 3), rel=1e-6
+            )
+        finally:
+            tracker.close()
+
+    def test_no_double_apply_to_current_state(self, drl_scorer):
+        """Current state must get exactly lr*delta*1.0 — the upsert must not
+        pre-apply the delta and then broadcast it a second time."""
+        self._record(drl_scorer)
+        for src in SOURCES:
+            q, _, _ = self._q(drl_scorer, src, 0)
+            assert q == pytest.approx(0.15), (
+                "current-state Q must equal lr*delta applied exactly once"
+            )
+
+    def test_backward_propagation_after_visit_sequence(self, drl_scorer):
+        """Visit bucket 0, then (next round) bucket 1; round 2's delta must
+        also nudge bucket 0's Q via its decayed trace."""
+        conn = drl_scorer._tracker._get_conn()
+        sig = {src: "BUY" for src in SOURCES}
+        # Round 1: all sources fresh -> bucket 0, e=1, q0=0.15
+        drl_scorer.record_reward(
+            ticker="AAPL", date_str="2026-06-10", source_signals=sig,
+            predicted_signal="BUY", actual_signal="BUY", regime_return=0.01,
+        )
+        q0_r1, _, _ = self._q(drl_scorer, "trader", 0)
+        # Round 2: every source now has 1 correct prediction -> bucket 1.
+        for s in SOURCES:
+            conn.execute(
+                "INSERT INTO predictions (ticker, date, source, predicted_signal, "
+                "actual_signal, correct) "
+                "VALUES ('AAPL', '2026-06-11', ?, 'BUY', 'BUY', 1)",
+                (s,),
+            )
+        conn.commit()
+        drl_scorer.record_reward(
+            ticker="AAPL", date_str="2026-06-12", source_signals=sig,
+            predicted_signal="BUY", actual_signal="BUY", regime_return=0.01,
+        )
+        q0_r2, e0_r2, _ = self._q(drl_scorer, "trader", 0)
+        # bucket 0 not revisited: trace decayed 1 -> 0.63, then received
+        # lr2 * delta2 * 0.63 with delta2 > 0 (fresh bucket 1, reward +1).
+        assert e0_r2 == pytest.approx(0.63), "old trace must decay by gamma*lambda"
+        assert q0_r2 > q0_r1, "credit must leak backward to the prior state"
+
+    def test_credit_does_not_leak_across_sources(self, drl_scorer):
+        """Traces are per-source: trader's delta must not touch risk_judge."""
+        sig = {"trader": "BUY", "risk_judge": "BUY",
+               "investment_judge": "BUY", "portfolio_manager": "BUY"}
+        drl_scorer.record_reward(
+            ticker="AAPL", date_str="2026-06-10", source_signals=sig,
+            predicted_signal="BUY", actual_signal="BUY", regime_return=0.01,
+        )
+        # trader alone carries a trace in a different bucket
+        conn = drl_scorer._tracker._get_conn()
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, "
+            "q_value, visit_count, eligibility) "
+            "VALUES ('neutral', 'trader', 4, 0.0, 1, 0.5)"
+        )
+        conn.commit()
+        drl_scorer.record_reward(
+            ticker="AAPL", date_str="2026-06-11", source_signals=sig,
+            predicted_signal="BUY", actual_signal="BUY", regime_return=0.01,
+        )
+        q, e, n = self._q(drl_scorer, "risk_judge", 4)
+        assert q is None, "per-source traces must not leak across sources"
+
+    def test_reset_clears_traces(self, drl_scorer):
+        self._record(drl_scorer)
+        drl_scorer.reset_qtable()
+        conn = drl_scorer._tracker._get_conn()
+        rows = conn.execute(
+            "SELECT q_value, eligibility FROM drl_qtable"
+        ).fetchall()
+        assert rows, "rows must exist post-reset"
+        assert all(
+            r["q_value"] == 0.0 and r["eligibility"] == 0.0 for r in rows
+        )
+
+    def test_lambda_accumulates_more_credit_than_td0(self, tmp_path):
+        """On a state-advancing trajectory (streaks 0->5 across rounds),
+        TD(lambda) accumulates strictly more total Q than TD(0), because
+        each round's delta also credits the earlier buckets that led there."""
+        from tradingagents.graph.consensus import DRLWeightedScorer, AccuracyTracker
+        results = {}
+        for lam in (0.0, DRL_TRACE_LAMBDA):
+            tracker = AccuracyTracker(db_path=str(tmp_path / f"t_{lam}.db"))
+            scorer = DRLWeightedScorer(tracker)
+            scorer.trace_lambda = lam
+            conn = tracker._get_conn()
+            sig = {src: "BUY" for src in SOURCES}
+            for i in range(10):
+                # advance every source's streak by one correct prediction
+                # so the visited bucket walks 0,1,2,3,4,4,4,4,4,4
+                for s in SOURCES:
+                    conn.execute(
+                        "INSERT INTO predictions (ticker, date, source, "
+                        "predicted_signal, actual_signal, correct) "
+                        "VALUES ('AAPL', ?, ?, 'BUY', 'BUY', 1)",
+                        (f"2026-06-{i+1:02d}", s),
+                    )
+                conn.commit()
+                scorer.record_reward(
+                    ticker="AAPL", date_str=f"2026-06-{i+1:02d}",
+                    source_signals=sig, predicted_signal="BUY",
+                    actual_signal="BUY", regime_return=0.01,
+                )
+            row = conn.execute(
+                "SELECT SUM(q_value) AS s FROM drl_qtable WHERE source='trader'"
+            ).fetchone()
+            results[lam] = row["s"]
+            tracker.close()
+        assert results[DRL_TRACE_LAMBDA] > results[0.0] + 1e-9, (
+            f"TD(lambda) should accumulate more credit: {results}"
+        )
+
+    def test_migration_adds_eligibility_to_legacy_db(self, tmp_path):
+        """Legacy DBs (visit_count era) must gain the eligibility column."""
+        legacy_path = str(tmp_path / "legacy2.db")
+        conn = sqlite3.connect(legacy_path)
+        conn.execute(
+            "CREATE TABLE drl_qtable ("
+            "regime_bucket TEXT NOT NULL, source TEXT NOT NULL, "
+            "streak_bucket INTEGER NOT NULL, q_value REAL NOT NULL DEFAULT 0.0, "
+            "visit_count INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (regime_bucket, source, streak_bucket))"
+        )
+        conn.execute(
+            "INSERT INTO drl_qtable VALUES ('neutral', 'trader', 0, 0.5, 3)"
+        )
+        conn.commit()
+        conn.close()
+
+        tracker = AccuracyTracker(db_path=legacy_path)
+        try:
+            check = tracker._get_conn()
+            row = check.execute(
+                "SELECT q_value, visit_count, eligibility FROM drl_qtable "
+                "WHERE source='trader'"
+            ).fetchone()
+            assert row["q_value"] == 0.5
+            assert row["visit_count"] == 3
+            assert row["eligibility"] == 0.0
+        finally:
+            tracker.close()
