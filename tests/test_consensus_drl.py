@@ -26,6 +26,8 @@ from tradingagents.graph.consensus import (
     DRL_MAX_WEIGHT_ADJUST,
     MIN_WEIGHT,
     REPLAY_MAX_EPOCHS,
+    WILSON_Z,
+    _wilson_lower_bound,
     REPLAY_CONVERGENCE_TOL,
     SOURCES,
 )
@@ -1337,3 +1339,65 @@ class TestTDLambdaEligibility:
             assert row["eligibility"] == 0.0
         finally:
             tracker.close()
+
+
+# ---------------------------------------------------------------------------
+# Wilson score lower bound for accuracy weighting
+# ---------------------------------------------------------------------------
+
+class TestWilsonLowerBound:
+    """Small-sample accuracy overfitting fix: raw correct/total replaced with
+    the Wilson score lower bound (proven pattern from prior experiments;
+    severity-4 transfer goal for trading-agents)."""
+
+    def test_wilson_helper_known_values(self):
+        # 1/1 raw accuracy is 100%, Wilson LB at 95% is ~0.20
+        assert abs(_wilson_lower_bound(1, 1) - 0.20) < 0.01
+        # 100/100 stays high (~0.963)
+        assert abs(_wilson_lower_bound(100, 100) - 0.963) < 0.001
+        # 0/0 (unseen) -> neutral 0.5
+        assert _wilson_lower_bound(0, 0) == 0.5
+        # monotone: more evidence at same rate -> higher LB
+        assert _wilson_lower_bound(8, 10) > _wilson_lower_bound(4, 5)
+
+    def test_lucky_one_shot_does_not_outrank_proven(self, tracker):
+        """Source with 1/1 correct must NOT outweigh a source at 55/100."""
+        rows = [
+            ("investment_judge", 1, 1),      # lucky one-shot (raw acc 100%)
+            ("trader", 55, 100),             # proven 55%
+            ("risk_judge", 30, 50),          # steady 60%
+            ("portfolio_manager", 2, 5),     # weak small-sample
+        ]
+        day = 0
+        for source, correct, total in rows:
+            for i in range(total):
+                day += 1
+                date = f"2026-01-{day:03d}"
+                pred = "BUY" if i < correct else "SELL"
+                tracker.record_prediction("WIL", date, source, pred)
+                tracker.record_outcome("WIL", date, pred)  # grade as predicted
+
+        weights = tracker.get_weights()
+        assert weights["trader"] > weights["investment_judge"], (
+            "Wilson LB should prevent a 1/1 lucky source from outranking 55/100"
+        )
+
+    def test_weights_still_normalized_and_floored(self, tracker):
+        """get_weights output remains a valid simplex with MIN_WEIGHT floor."""
+        for i in range(40):
+            date = f"2026-02-{i:03d}"
+            pred = "BUY" if i % 2 else "SELL"
+            tracker.record_prediction("NORM", date, "investment_judge", pred)
+            tracker.record_outcome("NORM", date, pred)  # all correct
+        weights = tracker.get_weights()
+        assert abs(sum(weights.values()) - 1.0) < 0.01
+        assert all(w >= MIN_WEIGHT - 1e-6 for w in weights.values())
+
+    def test_no_history_equal_weights(self, tracker):
+        """Below MIN_PREDICTIONS_FOR_WEIGHTING the tracker still returns equal weights."""
+        weights = tracker.get_weights()
+        assert set(weights) == set(SOURCES)
+        assert all(abs(w - 0.25) < 1e-6 for w in weights.values())
+
+    def test_wilson_z_constant_sane(self):
+        assert 1.9 < WILSON_Z < 2.0  # 95% confidence

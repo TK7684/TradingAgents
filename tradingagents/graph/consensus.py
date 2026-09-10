@@ -115,6 +115,12 @@ FORWARD_GATE_MIN_PREDICTIONS: int = 20
 # Number of recent predictions to validate against.
 FORWARD_GATE_WINDOW: int = 20
 
+#: Wilson score interval z-value (95% confidence).  Used to compute a
+#: conservative lower bound on per-source accuracy so that sources with a
+#: handful of lucky predictions cannot outrank consistently proven sources.
+#: lb = (p + z^2/(2n) - z*sqrt(p(1-p)/n + z^2/(4n^2))) / (1 + z^2/n)
+WILSON_Z: float = 1.96
+
 # Experience-Replay optimization (arxiv:2607.18001 RL reward optimisation loop):
 # Replays graded historical predictions through the Q-learning update until
 # the mean |TD error| converges, so weights are optimised from *all* past
@@ -327,6 +333,35 @@ class ConsensusSignalExtractor:
             raw_text=raw_str[:500],  # cap for logging/storage
             extraction_method=method,
         )
+
+
+
+def _wilson_lower_bound(correct: int, total: int, z: float = WILSON_Z) -> float:
+    """Wilson score interval lower bound (Wilson 1927).
+
+    A conservative, sample-size-aware estimate of the true win-rate.
+    Raw accuracy ``correct/total`` overrates small samples: 1/1 = 100%.
+    The Wilson LB for 1/1 at z=1.96 is ~0.20, and for 100/100 it is ~0.963,
+    so a lucky one-shot source can no longer dominate weighting.
+
+    Args:
+        correct: Number of correct predictions.
+        total:   Number of graded predictions (must be > 0).
+        z:       Z-value for the desired confidence level (default 95%).
+
+    Returns:
+        The Wilson lower bound in ``[0, 1]``; ``0.5`` when ``total == 0``
+        (unseen source - neutral prior, matching existing behaviour).
+    """
+    if total <= 0:
+        return 0.5
+    n = float(total)
+    p = correct / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = p + z2 / (2.0 * n)
+    margin = z * math.sqrt((p * (1.0 - p)) / n + z2 / (4.0 * n * n))
+    return max(0.0, (centre - margin) / denom)
 
 
 # ---------------------------------------------------------------------------
@@ -607,11 +642,20 @@ class AccuracyTracker:
             equal = 1.0 / len(SOURCES)
             return {src: round(equal, 4) for src in SOURCES}
 
-        # Build raw weights from accuracy; default to 0.5 for unseen sources
+        # Build raw weights from the Wilson score lower bound of accuracy
+        # rather than raw accuracy.  Raw accuracy overrates tiny samples
+        # (1/1 = 100%); the Wilson LB shrinks small-sample estimates toward
+        # 0.5 so an unproven source cannot outrank a proven one until its
+        # track record justifies it.  Unseen sources default to 0.5.
         raw: Dict[str, float] = {}
         for src in SOURCES:
-            acc = stats.get(src, {}).get("accuracy", 0.5)
-            raw[src] = max(float(acc), MIN_WEIGHT)
+            s = stats.get(src, {})
+            raw[src] = max(
+                _wilson_lower_bound(
+                    int(s.get("correct", 0)), int(s.get("total", 0))
+                ),
+                MIN_WEIGHT,
+            )
 
         # Normalise
         total = sum(raw.values())
