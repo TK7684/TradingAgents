@@ -146,6 +146,23 @@ SELFPLAY_EPSILON: float = 0.10
 #: Deterministic seed (tournament must be reproducible run-to-run).
 SELFPLAY_SEED: int = 42
 
+# Prioritized Experience Replay (Schaul et al. 2016, arXiv:1511.05952):
+# Proportional variant — replay transitions sampled ∝ (|TD error|+eps)^alpha,
+# corrected by importance-sampling weights (N*p)^-beta to stay unbiased.
+#: Priority exponent: 0 = uniform, 1 = fully greedy by |TD error|.
+PER_ALPHA: float = 0.6
+#: IS exponent start (annealed linearly to 1 across epochs — full correction).
+PER_BETA: float = 0.4
+#: Additive floor on |TD error| priorities (paper's epsilon): guarantees every
+#: transition nonzero sampling probability AND collapses IS weights to exactly
+#: 1 when residuals are homogeneous (uniform-replay behaviour at convergence).
+PER_EPS: float = 1e-3
+#: Starting fraction of the replay buffer sampled per PER epoch. The
+#: fraction anneals linearly to 1.0 (full pass) across max_epochs so the
+#: terminal epochs are deterministic full Bellman passes — exact convergence
+#: to the same fixed point as uniform replay.
+PER_SAMPLE_FRACTION: float = 0.5
+
 # ---------------------------------------------------------------------------
 # Regex patterns (mirrors signal_processing.py)
 
@@ -1265,6 +1282,10 @@ class DRLWeightedScorer:
         max_epochs: int = REPLAY_MAX_EPOCHS,
         convergence_tol: float = REPLAY_CONVERGENCE_TOL,
         buffer_limit: int = REPLAY_BUFFER_LIMIT,
+        priority: bool = False,
+        per_alpha: float = PER_ALPHA,
+        per_beta: float = PER_BETA,
+        per_sample_fraction: float = PER_SAMPLE_FRACTION,
     ) -> Dict[str, Any]:
         """Experience-replay reward optimisation loop (RL from historical outcomes).
 
@@ -1272,6 +1293,19 @@ class DRLWeightedScorer:
         same Q-learning update used online (``record_reward``) until the table
         converges (max per-pass Q-movement below *convergence_tol*) or
         *max_epochs* passes are reached.
+
+        When *priority* is True, uses proportional Prioritized Experience
+        Replay (Schaul et al. 2016): each epoch samples a subset of
+        transitions with probability ∝ (|last TD error|+eps)^per_alpha
+        (Efraimidis–Spirakis weighted sampling without replacement) and
+        corrects the resulting bias with importance-sampling weights
+        (N·p_i)^-beta, beta annealed linearly towards 1 across epochs.
+        High-|TD-error| transitions (surprising outcomes) are replayed more
+        often, focusing updates where the Bellman residual is largest.
+        The sampled fraction itself anneals linearly from
+        *per_sample_fraction* to 1.0, so terminal epochs are full
+        deterministic passes and the loop converges to exactly the same
+        fixed point as uniform replay.
 
         Fidelity notes (vs the online path):
 
@@ -1306,6 +1340,7 @@ class DRLWeightedScorer:
                 "converged": True,
                 "final_td_error": 0.0,
                 "td_error_history": [],
+                "td_max_history": [],
                 "q_movement_history": [],
             }
 
@@ -1378,8 +1413,20 @@ class DRLWeightedScorer:
             replay_rounds.append((reward, regime_bucket, per_source))
 
         td_error_history: list = []
+        td_max_history: list = []
         q_movement_history: list = []
         converged = False
+
+        # Flatten to per-transition list once: (reward, regime, source,
+        # streak_bucket, next_bucket). Uniform mode replays all of them in
+        # order; PER mode samples a prioritised subset each epoch.
+        transitions = [
+            (reward, regime_bucket, source, streak_bucket, next_bucket)
+            for reward, regime_bucket, per_source in replay_rounds
+            for source, streak_bucket, next_bucket in per_source
+        ]
+        # Last-seen |TD error| per transition index (priority signal).
+        priorities: list = [0.0] * len(transitions)
 
         for epoch in range(1, max_epochs + 1):
             # Start-of-pass snapshot: every update this pass bootstraps from
@@ -1392,40 +1439,100 @@ class DRLWeightedScorer:
                 ).fetchall()
             }
 
+            # -- PER: rank-based sampling of a subset of transitions --------
+            if priority and transitions:
+                import random as _random
+
+                n = len(transitions)
+                # Sampling anneal: fraction grows linearly to 1.0 so the
+                # final epochs replay every transition (deterministic full
+                # pass -> exact convergence, same fixed point as uniform).
+                frac = per_sample_fraction + (
+                    (1.0 - per_sample_fraction) * (epoch - 1) / max(1, max_epochs - 1)
+                )
+                k = max(1, min(n, int(round(frac * n))))
+
+                # Proportional priorities p_i ∝ (|TD_i| + eps)^alpha. The
+                # eps floor guarantees nonzero probability for unvisited
+                # transitions and makes weights exactly uniform (IS = 1)
+                # once residuals homogenise near the fixed point — no
+                # persistent rank artifact as with rank-based ties.
+                weights = [
+                    (prio + PER_EPS) ** per_alpha for prio in priorities
+                ]
+                # Efraimidis–Spirakis A-ES weighted sampling without
+                # replacement: key_i = u^(1/w_i); take the k largest keys.
+                keys = [
+                    (_random.random() ** (1.0 / w)) if w > 0 else -1.0
+                    for w in weights
+                ]
+                selected = sorted(
+                    sorted(range(n), key=lambda i: -keys[i])[:k]
+                )  # chronological order preserved within the pass
+
+                # IS weights: w_i = (N * p_i)^-beta with beta annealed
+                # linearly towards 1 across epochs (full correction at the
+                # end, matching the PER paper's annealing schedule).
+                beta = min(
+                    1.0,
+                    per_beta
+                    + (1.0 - per_beta) * (epoch - 1) / max(1, max_epochs - 1),
+                )
+                total_w = sum(weights)
+                is_weight: Dict[int, float] = {}
+                max_isw = 0.0
+                for i in selected:
+                    p_i = weights[i] / total_w
+                    isw = (n * p_i) ** (-beta)
+                    is_weight[i] = isw
+                    max_isw = max(max_isw, isw)
+                # Normalise by max so updates are bounded by the plain LR.
+                for i in selected:
+                    is_weight[i] /= max(max_isw, 1e-12)
+            else:
+                selected = list(range(len(transitions)))
+                is_weight = {}
+
             epoch_td_errors: list = []
             epoch_movements: list = []
 
-            for reward, regime_bucket, per_source in replay_rounds:
-                for source, streak_bucket, next_bucket in per_source:
-                    key = (regime_bucket, source, streak_bucket)
-                    old_q = q_snapshot.get(key, 0.0)
+            for idx in selected:
+                reward, regime_bucket, source, streak_bucket, next_bucket = (
+                    transitions[idx]
+                )
+                key = (regime_bucket, source, streak_bucket)
+                old_q = q_snapshot.get(key, 0.0)
 
-                    if next_bucket == streak_bucket:
-                        # self-transition: bootstrap from the current estimate
-                        next_q = old_q
-                    else:
-                        next_q = q_snapshot.get(
-                            (regime_bucket, source, next_bucket), 0.0
-                        )
-
-                    td_error = reward + self.discount_factor * next_q - old_q
-                    new_q = old_q + self.learning_rate * td_error
-                    epoch_td_errors.append(abs(td_error))
-                    epoch_movements.append(abs(new_q - old_q))
-
-                    conn.execute(
-                        "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
-                        "VALUES (?, ?, ?, ?) "
-                        "ON CONFLICT(regime_bucket, source, streak_bucket) "
-                        "DO UPDATE SET q_value = excluded.q_value",
-                        (regime_bucket, source, streak_bucket, new_q),
+                if next_bucket == streak_bucket:
+                    # self-transition: bootstrap from the current estimate
+                    next_q = old_q
+                else:
+                    next_q = q_snapshot.get(
+                        (regime_bucket, source, next_bucket), 0.0
                     )
+
+                td_error = reward + self.discount_factor * next_q - old_q
+                priorities[idx] = abs(td_error)
+                step = self.learning_rate * td_error * is_weight.get(idx, 1.0)
+                new_q = old_q + step
+                epoch_td_errors.append(abs(td_error))
+                epoch_movements.append(abs(new_q - old_q))
+
+                conn.execute(
+                    "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(regime_bucket, source, streak_bucket) "
+                    "DO UPDATE SET q_value = excluded.q_value",
+                    (regime_bucket, source, streak_bucket, new_q),
+                )
 
             conn.commit()
 
             mean_td = sum(epoch_td_errors) / len(epoch_td_errors) if epoch_td_errors else 0.0
+            max_td = max(epoch_td_errors) if epoch_td_errors else 0.0
             max_movement = max(epoch_movements) if epoch_movements else 0.0
             td_error_history.append(round(mean_td, 6))
+            td_max_history.append(round(max_td, 6))
             q_movement_history.append(round(max_movement, 8))
             log.debug(
                 "Replay epoch %d: mean |TD error| = %.6f, max |dQ| = %.8f (%d updates)",
@@ -1446,6 +1553,7 @@ class DRLWeightedScorer:
             "converged": converged,
             "final_td_error": td_error_history[-1] if td_error_history else 0.0,
             "td_error_history": td_error_history,
+            "td_max_history": td_max_history,
             "q_movement_history": q_movement_history,
         }
 
