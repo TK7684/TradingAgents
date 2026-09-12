@@ -156,15 +156,27 @@ class SignalFilter:
         return disagreements / max(directional_count, 1)
 
     def _worst_source_accuracy(self) -> tuple[str, float]:
-        """Return (worst_source_name, worst_accuracy)."""
+        """Return (worst_source_name, worst_accuracy_pct).
+
+        Accuracy is EB-shrunk with the same beta-binomial prior as ticker
+        accuracy, and "worst" is ranked by the shrunk value, so a 0/2
+        source reads ~35.7% instead of 0% and cannot trigger a spurious
+        WARN downweight off a tiny sample.
+        """
+        prior_correct = EB_PRIOR_STRENGTH * EB_PRIOR_MEAN
         conn = sqlite3.connect(self.db_path)
         row = conn.execute(
-            "SELECT source, accuracy FROM source_stats ORDER BY accuracy ASC LIMIT 1"
+            "SELECT source, "
+            "  100.0 * (correct_predictions + ?) / (total_predictions + ?) "
+            "FROM source_stats "
+            "ORDER BY (correct_predictions + ?) * 1.0 / (total_predictions + ?) ASC "
+            "LIMIT 1",
+            (prior_correct, EB_PRIOR_STRENGTH, prior_correct, EB_PRIOR_STRENGTH),
         ).fetchone()
         conn.close()
         if not row:
             return "unknown", 50.0
-        return row[0], row[1] * 100  # stored as 0–1, convert to %
+        return row[0], row[1]
 
     def _query_ticker_stats(self) -> list[dict]:
         """Query all tickers with 5+ predictions."""

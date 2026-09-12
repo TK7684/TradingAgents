@@ -125,3 +125,55 @@ class TestCLIUnchanged:
         # Consistency with consensus.py BAYES_PRIOR_STRENGTH = 5
         assert EB_PRIOR_STRENGTH == 5
         assert EB_PRIOR_MEAN == 0.5
+
+
+class TestSourceEBShrinkage:
+    """Source-level WARN gate must use EB-shrunk accuracy, not raw.
+
+    Raw 0/2 reads as 0% and would spuriously WARN-downweight every trade;
+    shrunk it reads (0+2.5)/(2+5) = 35.7% — above the 25% WARN threshold.
+    """
+
+    def _stats(self, db, rows):
+        conn = sqlite3.connect(db)
+        conn.executemany(
+            "INSERT INTO source_stats (source, total_predictions, "
+            "correct_predictions, accuracy, updated_at) "
+            "VALUES (?, ?, ?, ?, '2026-01-01')",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+
+    def test_tiny_bad_source_not_zero(self, db):
+        sf = SignalFilter(db_path=db)
+        self._stats(db, [("weak", 2, 0, 0.0)])
+        src, acc = sf._worst_source_accuracy()
+        assert src == "weak"
+        assert acc == pytest.approx((0 + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN)
+                                    / (2 + EB_PRIOR_STRENGTH) * 100)
+
+    def test_tiny_bad_source_does_not_trigger_warn(self, db):
+        sf = SignalFilter(db_path=db)
+        self._stats(db, [("weak", 2, 0, 0.0)])
+        allowed, reason = sf.should_trade("NVDA", "BUY")
+        assert allowed is True
+        assert not reason.startswith("WARN")
+
+    def test_large_bad_sample_still_warns(self, db):
+        sf = SignalFilter(db_path=db)
+        self._stats(db, [("bad", 50, 5, 0.10)])
+        # shrunk = (5 + 2.5) / (50 + 5) = 13.6% < 25% -> WARN
+        allowed, reason = sf.should_trade("NVDA", "BUY")
+        assert allowed is True
+        assert reason.startswith("WARN")
+        assert "bad" in reason
+
+    def test_empty_source_stats_no_warn(self, db):
+        sf = SignalFilter(db_path=db)
+        src_name, acc = sf._worst_source_accuracy()
+        assert src_name == "unknown"
+        assert acc == 50.0
+        allowed, reason = sf.should_trade("NVDA", "BUY")
+        assert allowed is True
+        assert reason == "OK"
