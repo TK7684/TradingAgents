@@ -179,13 +179,21 @@ class SignalFilter:
         return row[0], row[1]
 
     def _query_ticker_stats(self) -> list[dict]:
-        """Query all tickers with 5+ predictions."""
+        """Query all tickers with 5+ predictions.
+
+        Accuracy is EB-shrunk (same beta-binomial prior as
+        _ticker_accuracy) so the displayed number matches the value the
+        gating decision actually uses; raw correct/total overstates
+        small samples (AGI pattern: small-sample accuracy overfitting).
+        """
         conn = sqlite3.connect(self.db_path)
+        prior_correct = EB_PRIOR_STRENGTH * EB_PRIOR_MEAN
         rows = conn.execute(
             "SELECT ticker, COUNT(*) as n, SUM(correct) as correct, "
-            "ROUND(100.0 * SUM(correct) / COUNT(*), 1) as wr "
+            "ROUND(100.0 * (SUM(correct) + ?) / (COUNT(*) + ?), 1) as wr "
             "FROM predictions WHERE ticker NOT IN ('UNKNOWN', 'BTC') "
-            "GROUP BY ticker HAVING n >= 5 ORDER BY wr ASC"
+            "GROUP BY ticker HAVING n >= 5 ORDER BY wr ASC",
+            (prior_correct, EB_PRIOR_STRENGTH),
         ).fetchall()
         conn.close()
         return [
