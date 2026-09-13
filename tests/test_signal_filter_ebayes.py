@@ -177,3 +177,42 @@ class TestSourceEBShrinkage:
         allowed, reason = sf.should_trade("NVDA", "BUY")
         assert allowed is True
         assert reason == "OK"
+
+
+class TestStatsDisplayShrinkage:
+    """_query_ticker_stats must report EB-shrunk accuracy, matching the
+    gating basis (_ticker_accuracy), not raw correct/total (AGI pattern:
+    small-sample accuracy overfitting — display must not lie about the
+    decision basis)."""
+
+    def _seed(self, db, ticker, n_correct, n_wrong):
+        conn = sqlite3.connect(db)
+        for _ in range(n_correct):
+            _add_prediction(conn, ticker, 1)
+        for _ in range(n_wrong):
+            _add_prediction(conn, ticker, 0)
+        conn.commit()
+        conn.close()
+
+    def test_stats_accuracy_is_shrunk(self, db):
+        # 4/5 raw = 80%; EB = (4+2.5)/(5+5) = 65%
+        self._seed(db, "TSM", 4, 1)
+        sf = SignalFilter(db_path=db)
+        stats = {s["ticker"]: s for s in sf.get_ticker_stats()}
+        assert stats["TSM"]["accuracy"] == pytest.approx(65.0, abs=0.05)
+
+    def test_stats_raw_fields_preserved(self, db):
+        self._seed(db, "TSM", 4, 1)
+        sf = SignalFilter(db_path=db)
+        stats = {s["ticker"]: s for s in sf.get_ticker_stats()}
+        # raw counts stay visible for auditability
+        assert stats["TSM"]["correct"] == 4
+        assert stats["TSM"]["predictions"] == 5
+
+    def test_stats_matches_gating_accuracy(self, db):
+        # displayed accuracy == _ticker_accuracy for the same ticker
+        self._seed(db, "AMD", 3, 7)
+        sf = SignalFilter(db_path=db)
+        stats = {s["ticker"]: s for s in sf.get_ticker_stats()}
+        gate_acc, _ = sf._ticker_accuracy("AMD")
+        assert stats["AMD"]["accuracy"] == pytest.approx(gate_acc, abs=0.06)
