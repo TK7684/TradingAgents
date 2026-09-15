@@ -20,6 +20,12 @@ load_dotenv()
 import yfinance as yf
 import requests
 
+# Repo root on sys.path so the proven Wilson LB from consensus.py is reusable
+# (same pattern as backfill_scores.py). Pattern #18: raw correct/total accuracy
+# overrates small samples (1/1 = 100%) and leaks into display + gating paths.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tradingagents.graph.consensus import _wilson_lower_bound
+
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 RESULTS_DIR = os.path.expanduser("~/TradingAgents/results/daily")
 BACKTEST_DIR = os.path.expanduser("~/TradingAgents/results/backtest")
@@ -77,6 +83,17 @@ def score_decision(decision, returns):
         return "neutral"
 
 
+def wilson_lb_pct(correct, total):
+    """Conservative accuracy percent (Wilson score lower bound, z=1.96).
+
+    Replaces raw ``correct/total`` in every accuracy this script reports
+    (overall summary, per-ticker table, Discord gates) so a 1/1 ticker no
+    longer shows as 100% green. No graded data -> 50.0 neutral prior,
+    matching the consensus.py convention for unseen sources.
+    """
+    return round(_wilson_lower_bound(int(correct), int(total)) * 100, 1)
+
+
 def run_backtest(ticker_filter=None, period_days=None):
     os.makedirs(BACKTEST_DIR, exist_ok=True)
     files = sorted(glob.glob(os.path.join(RESULTS_DIR, "*.json")))
@@ -124,7 +141,7 @@ def run_backtest(ticker_filter=None, period_days=None):
     correct = sum(1 for s in all_scores if s["score"] == "correct")
     wrong = sum(1 for s in all_scores if s["score"] == "wrong")
     total = correct + wrong
-    accuracy = round(correct / total * 100, 1) if total > 0 else 0
+    accuracy = wilson_lb_pct(correct, total)
 
     print("\n" + "=" * 50)
     print("BACKTEST RESULTS")
@@ -143,7 +160,7 @@ def run_backtest(ticker_filter=None, period_days=None):
     for t, stats in sorted(ticker_stats.items()):
         c = stats["correct"]
         w = stats["wrong"]
-        acc = round(c / (c + w) * 100, 1) if (c + w) > 0 else 0
+        acc = wilson_lb_pct(c, c + w)
         print("{:<8} {:<8} {:<8} {}%".format(t, c, w, acc))
 
     # Save
@@ -162,7 +179,7 @@ def run_backtest(ticker_filter=None, period_days=None):
         for t, stats in sorted(ticker_stats.items()):
             c = stats["correct"]
             w = stats["wrong"]
-            acc = round(c / (c + w) * 100, 1) if (c + w) > 0 else 0
+            acc = wilson_lb_pct(c, c + w)
             lines.append("**{}** — {}% ({}/{})".format(t, acc, c, c + w))
         payload = {"embeds": [{"title": "{} Backtest: {}% accuracy".format(emoji, accuracy),
                    "description": "Total: {} decisions\n\n{}".format(len(all_scores), "\n".join(lines)),
