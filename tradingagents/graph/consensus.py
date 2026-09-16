@@ -870,14 +870,16 @@ class DRLWeightedScorer:
     ``(regime_bucket, source, streak_bucket)`` and uses reward feedback
     from consensus outcomes to learn per-source weight adjustments.
 
-    Final weights are an alpha-blend of accuracy-based and DRL-based weights::
+    Final weights apply the learned Q-table as a bounded *residual* on top
+    of the accuracy baseline (ResSafe-style residual RL)::
 
-        final_weight = (1 - alpha) * accuracy_weight + alpha * drl_weight
+        final_weight = normalise(max(MIN_WEIGHT, accuracy + alpha * adj))
 
-    This keeps the system safe: when there is no DRL history, it falls back
-    to pure accuracy weighting.  As reward history accumulates, the DRL
-    component gradually shifts weights toward what has worked recently in
-    the current market regime.
+    This keeps the system safe: the Q-table refines the proven accuracy
+    baseline instead of competing with it as a standalone weight vector.
+    A degenerate Q-table can move any single weight by at most
+    ``alpha * max_weight_adjust``, so it can never flip a consensus the
+    accuracy baseline wins with a larger margin.
     """
 
     def __init__(
@@ -956,31 +958,33 @@ class DRLWeightedScorer:
 
         drl_adjustments = self._get_drl_weight_adjustments(regime_bucket, source_signals)
 
-        # Convert adjustments into raw DRL weights:
-        # Start from equal, apply adjustments, then normalise.
+        # Residual RL blending (ResSafe, arxiv:2609.12791): the Q-table
+        # learns only a bounded residual correction ON TOP of the proven
+        # accuracy baseline -- never a standalone alternative weight vector.
+        #
+        #   final = normalise( max(MIN_WEIGHT, accuracy + alpha * adj) )
+        #
+        # The per-source adjustment is clamped to +/-max_weight_adjust, so
+        # a degenerate Q-table can move any single weight by at most
+        # alpha * max_weight_adjust and cannot flip a consensus the
+        # accuracy baseline wins with a larger margin.  The learned policy
+        # refines the safe baseline instead of competing with it; the
+        # forward-gate below remains as a second line of defence.
         equal_weight = 1.0 / len(SOURCES)
-        raw_drl: Dict[str, float] = {}
-        for src in SOURCES:
-            raw_drl[src] = max(
-                MIN_WEIGHT,
-                equal_weight + drl_adjustments.get(src, 0.0),
-            )
-
-        # Normalise DRL weights to sum to 1
-        drl_total = sum(raw_drl.values())
-        if drl_total > 0:
-            drl_weights = {src: w / drl_total for src, w in raw_drl.items()}
-        else:
-            drl_weights = {src: equal_weight for src in SOURCES}
-
-        # Alpha blend
         blended: Dict[str, float] = {}
         for src in SOURCES:
             aw = accuracy_weights.get(src, equal_weight)
-            dw = drl_weights.get(src, equal_weight)
-            blended[src] = round(
-                (1.0 - self.drl_alpha) * aw + self.drl_alpha * dw, 4
-            )
+            residual = self.drl_alpha * drl_adjustments.get(src, 0.0)
+            blended[src] = max(MIN_WEIGHT, aw + residual)
+
+        # Normalise to sum to 1
+        blended_total = sum(blended.values())
+        if blended_total > 0:
+            blended = {
+                src: round(w / blended_total, 4) for src, w in blended.items()
+            }
+        else:
+            blended = {src: round(equal_weight, 4) for src in SOURCES}
 
         # --- Forward-Gate: validate DRL weights before deployment ---
         # If DRL-blended weights would have produced more wrong consensus

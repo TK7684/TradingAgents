@@ -478,12 +478,16 @@ class TestForwardGate:
                     "risk_judge": "SELL", "portfolio_manager": "HOLD"}
         weights = scorer.get_blended_weights(signals, regime_return=0.0)
 
-        # Gate should have blocked the degenerate DRL weights
-        # Verify by comparing to accuracy weights (what the gate falls back to)
+        # Residual RL (ResSafe): safety is now structural, not just gated.
+        # The adversarial Q-table can shift each weight by at most
+        # alpha * DRL_MAX_WEIGHT_ADJUST (before renormalisation), so it
+        # must NOT invert the ranking: risk_judge (the only correct
+        # source) stays the dominant weight.
         acc_weights = tracker.get_weights()
-        for src in SOURCES:
-            assert abs(weights[src] - acc_weights[src]) < 1e-3, \
-                f"Forward-gate should have blocked DRL for {src}: got {weights[src]}, expected {acc_weights[src]}"
+        assert weights["risk_judge"] == max(weights.values()), \
+            "degenerate Q must not dethrone the dominant accuracy weight"
+        assert weights["risk_judge"] > weights["investment_judge"]
+        assert abs(sum(weights.values()) - 1.0) < 1e-3
 
     def test_forward_gate_min_predictions_threshold(self, drl_scorer):
         """Gate should not activate with fewer than FORWARD_GATE_MIN_PREDICTIONS."""
@@ -1091,9 +1095,11 @@ class TestSelfPlayGate:
         weights = scorer.get_blended_weights(signals, regime_return=0.0)
 
         acc_weights = tracker.get_weights()
-        for src in SOURCES:
-            assert abs(weights[src] - acc_weights[src]) < 1e-3, \
-                f"Self-play gate should have blocked DRL for {src}: got {weights[src]}, expected {acc_weights[src]}"
+        # Residual RL: the adversarial Q can perturb weights but must not
+        # invert the accuracy ranking (risk_judge stays dominant).
+        assert weights["risk_judge"] == max(weights.values())
+        assert weights["risk_judge"] > weights["investment_judge"]
+        assert abs(sum(weights.values()) - 1.0) < 1e-3
 # TD(lambda) eligibility traces (AGI cycle H20260830150558 — deploy of
 # stranded a6e5be4/55ca3a9, recomposed onto TD(0)-bootstrap + adaptive-LR)
 # ---------------------------------------------------------------------------
@@ -1572,3 +1578,91 @@ class TestPrioritizedReplay:
             assert mv <= lr * td_max + 1e-6, (
                 f"movement {mv} exceeds lr*max|TD| bound {lr * td_max}"
             )
+
+# ---------------------------------------------------------------------
+# Residual RL blending (ResSafe, arxiv:2609.12791) -- AGI cycle H20260916151804
+# ---------------------------------------------------------------------
+
+class TestResidualBlending:
+    """ResSafe residual RL: the Q-table contributes only a bounded residual
+    on top of the accuracy baseline -- never a standalone weight vector."""
+
+    def test_zero_q_blended_equals_accuracy(self, drl_scorer):
+        """With no Q-table entries, residual is 0 -> blended == accuracy."""
+        signals = {src: "BUY" for src in SOURCES}
+        weights = drl_scorer.get_blended_weights(signals, regime_return=0.0)
+        acc = drl_scorer._tracker.get_weights()
+        for src in SOURCES:
+            assert abs(weights[src] - acc[src]) < 1e-3
+
+    def test_residual_bound_holds_for_zero_sum_adversarial_q(self, tracker):
+        """Zero-sum adversarial Q (total residual = 0, so renormalisation is
+        a no-op): |blended - accuracy| <= alpha * max_adjust per source."""
+        scorer = DRLWeightedScorer(tracker, drl_alpha=1.0)
+        conn = tracker._get_conn()
+        # +Q on investment_judge, -Q on trader, nothing elsewhere: the
+        # pre-normalisation residual sums to zero so T == 1 exactly.
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+            "VALUES ('neutral', 'investment_judge', 0, 5.0)"
+        )
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+            "VALUES ('neutral', 'trader', 0, -5.0)"
+        )
+        conn.commit()
+        signals = {src: "BUY" for src in SOURCES}
+        weights = scorer.get_blended_weights(signals, regime_return=0.0)
+        acc = tracker.get_weights()
+        # No graded history -> accuracy weights are equal (0.25); the
+        # clamped residual moves each source exactly +/-0.15.
+        assert abs(weights["investment_judge"] - (0.25 + DRL_MAX_WEIGHT_ADJUST)) < 1e-3
+        assert abs(weights["trader"] - (0.25 - DRL_MAX_WEIGHT_ADJUST)) < 1e-3
+        for src in SOURCES:
+            assert abs(weights[src] - acc[src]) <= DRL_MAX_WEIGHT_ADJUST + 1e-3
+
+    def test_residual_cannot_flip_dominant_consensus(self, tracker):
+        """Even a maximally adversarial Q at alpha=1.0 cannot dethrone the
+        proven source: risk_judge (6/6 correct) must stay the argmax weight
+        no matter what the Q-table says about other sources."""
+        for i in range(6):
+            date = f"2026-06-{10+i:02d}"
+            tracker.record_prediction("TEST", date, "investment_judge", "BUY")
+            tracker.record_prediction("TEST", date, "trader", "BUY")
+            tracker.record_prediction("TEST", date, "risk_judge", "SELL")
+            tracker.record_prediction("TEST", date, "portfolio_manager", "HOLD")
+            tracker.record_outcome("TEST", date, "SELL")
+
+        scorer = DRLWeightedScorer(tracker, drl_alpha=1.0)
+        conn = tracker._get_conn()
+        for src in SOURCES:
+            q = 5.0 if src != "risk_judge" else -5.0  # maximally adversarial
+            conn.execute(
+                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+                "VALUES ('neutral', ?, 0, ?)",
+                (src, q),
+            )
+        conn.commit()
+
+        signals = {"investment_judge": "BUY", "trader": "BUY",
+                    "risk_judge": "SELL", "portfolio_manager": "HOLD"}
+        weights = scorer.get_blended_weights(signals, regime_return=0.0)
+        assert weights["risk_judge"] == max(weights.values()), weights
+
+    def test_weights_valid_with_q_entries(self, tracker):
+        """Sum-to-1 and MIN_WEIGHT floors hold with populated Q-table."""
+        scorer = DRLWeightedScorer(tracker, drl_alpha=1.0)
+        conn = tracker._get_conn()
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+            "VALUES ('neutral', 'investment_judge', 0, 5.0)"
+        )
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
+            "VALUES ('neutral', 'risk_judge', 0, -5.0)"
+        )
+        conn.commit()
+        signals = {src: "SELL" for src in SOURCES}
+        weights = scorer.get_blended_weights(signals, regime_return=0.0)
+        assert abs(sum(weights.values()) - 1.0) < 1e-3
+        assert all(w >= MIN_WEIGHT for w in weights.values())
