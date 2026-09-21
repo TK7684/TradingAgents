@@ -1646,13 +1646,16 @@ class TestResidualBlending:
         conn = tracker._get_conn()
         # +Q on investment_judge, -Q on trader, nothing elsewhere: the
         # pre-normalisation residual sums to zero so T == 1 exactly.
+        # Insert into BOTH estimators so the deployed averaged value
+        # (A+B)/2 saturates the clamp (double-Q lineage: single-estimator
+        # inserts read as half-strength after the b95e98c deploy).
         conn.execute(
-            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
-            "VALUES ('neutral', 'investment_judge', 0, 5.0)"
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value, q_value_b) "
+            "VALUES ('neutral', 'investment_judge', 0, 5.0, 5.0)"
         )
         conn.execute(
-            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
-            "VALUES ('neutral', 'trader', 0, -5.0)"
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value, q_value_b) "
+            "VALUES ('neutral', 'trader', 0, -5.0, -5.0)"
         )
         conn.commit()
         signals = {src: "BUY" for src in SOURCES}
