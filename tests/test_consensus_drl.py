@@ -1001,6 +1001,113 @@ class TestReplayOptimization:
         assert result["final_td_error"] == 0.0
         drl_scorer.reset_qtable()  # still works after replay
 
+    # -- Deployed-basis fidelity (AGI cycle H20260922150119) ----------------
+
+    def test_replay_writes_both_estimators(self, tracker, drl_scorer):
+        """Replay must mirror learned Q into q_value AND q_value_b.
+
+        The deployed basis is the double-Q average; writing only q_value
+        halves every learned adjustment in production weights.
+        """
+        self._seed_history(tracker, n_rounds=8)
+        drl_scorer.optimize_weights_from_history(max_epochs=10)
+        conn = tracker._get_conn()
+        mismatches = conn.execute(
+            "SELECT COUNT(*) FROM drl_qtable "
+            "WHERE q_value != q_value_b"
+        ).fetchone()[0]
+        assert mismatches == 0, (
+            f"{mismatches} rows diverged between estimators after replay"
+        )
+
+    def test_replay_bootstraps_from_deployed_average(self, tracker, drl_scorer):
+        """Pre-existing asymmetric estimators: replay converges the DEPLOYED
+        average to the analytic fixed point r/(1-gamma), not q_value alone.
+
+        Seeds A/B asymmetrically (the state the old code left behind), then
+        checks the deployed average after replay.
+        """
+        import math as _math
+
+        # All-correct history -> Q* = 1/(1-gamma) for streak bucket 4
+        for i in range(12):
+            date = f"2026-09-{i+1:02d}"
+            for source in SOURCES:
+                tracker.record_prediction("MSFT", date, source, "BUY")
+            tracker.record_outcome("MSFT", date, "BUY")
+
+        conn = tracker._get_conn()
+        # Simulate legacy asymmetric drift: A high, B low (avg = old basis).
+        conn.execute(
+            "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, "
+            "q_value, q_value_b) VALUES ('neutral', 'trader', 4, 8.0, 2.0) "
+            "ON CONFLICT(regime_bucket, source, streak_bucket) DO NOTHING"
+        )
+        conn.commit()
+
+        result = drl_scorer.optimize_weights_from_history(max_epochs=800)
+        assert result["converged"] is True
+        row = conn.execute(
+            "SELECT q_value, q_value_b, "
+            "(q_value + q_value_b) / 2.0 AS avg_q FROM drl_qtable "
+            "WHERE regime_bucket = 'neutral' AND source = 'trader' "
+            "AND streak_bucket = 4"
+        ).fetchone()
+        expected = 1.0 / (1.0 - drl_scorer.discount_factor)
+        assert row is not None
+        assert _math.isclose(row["avg_q"], expected, rel_tol=0.01), (
+            f"deployed avg should converge to r/(1-gamma)={expected}, "
+            f"got avg={row['avg_q']} (A={row['q_value']}, B={row['q_value_b']})"
+        )
+
+    def test_replay_deployed_adjustment_not_halved(self, tracker, drl_scorer):
+        """End-to-end wiring check: _get_drl_weight_adjustments (the
+        production weight lookup) returns clamp(table_avg * 0.05) using the
+        SAME averaged basis the replay wrote.
+
+        (The halving itself is caught by the two tests above; at the
+        analytic Q* the clamp saturates, so this test instead pins the
+        lookup -> table wiring and that the clamp binds at saturation.)
+        """
+        import math as _math
+
+        for i in range(12):
+            date = f"2026-09-{i+1:02d}"
+            for source in SOURCES:
+                tracker.record_prediction("MSFT", date, source, "BUY")
+            tracker.record_outcome("MSFT", date, "BUY")
+
+        drl_scorer.optimize_weights_from_history(max_epochs=800)
+        conn = tracker._get_conn()
+        row = conn.execute(
+            "SELECT (q_value + q_value_b) / 2.0 AS avg_q FROM drl_qtable "
+            "WHERE regime_bucket = 'neutral' AND source = 'trader' "
+            "AND streak_bucket = 4"
+        ).fetchone()
+        learned_avg = row["avg_q"]
+
+        # Force the streak lookup to land on bucket 4: all predictions in
+        # history are correct, so last-5 correct count = 5 -> bucket 4.
+        adjustments = drl_scorer._get_drl_weight_adjustments(
+            "neutral", {s: "BUY" for s in SOURCES}
+        )
+        expected_adj = max(
+            -drl_scorer.max_weight_adjust,
+            min(drl_scorer.max_weight_adjust, learned_avg * 0.05),
+        )
+        assert _math.isclose(
+            adjustments["trader"], expected_adj, rel_tol=1e-6
+        ), (
+            f"deployed adjustment {adjustments['trader']} should equal "
+            f"clamp(learned_avg*0.05)={expected_adj} with learned_avg="
+            f"{learned_avg} — a halved value means B is stale"
+        )
+        # And with Q* = 10 the clamp must actually be binding at
+        # max_weight_adjust (guards against silently testing at 0).
+        assert expected_adj == drl_scorer.max_weight_adjust, (
+            f"clamp should bind: expected {drl_scorer.max_weight_adjust}"
+        )
+
 # ---------------------------------------------------------------------------
 # Self-Play Gate Tests (AGI cycle H20260907150301)
 # ---------------------------------------------------------------------------

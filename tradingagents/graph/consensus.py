@@ -1349,7 +1349,10 @@ class DRLWeightedScorer:
           when outcomes resolved live.
         * Each pass reads Q-values from a start-of-pass snapshot (fitted-value
           iteration): one effective Bellman step per table entry per pass,
-          which contracts geometrically to the fixed point.
+          which contracts geometrically to the fixed point.  The snapshot —
+          and each write — uses the deployed double-Q average and mirrors
+          into both estimators, so the replayed table is the exact basis the
+          scorer deploys (display == decision basis, H20260922150119).
         * Regime is not stored per prediction; replay keys the ``neutral``
           regime bucket (the online path keys regime at reward time only).
         * The ``predictions`` table is never mutated — replay only writes
@@ -1466,10 +1469,22 @@ class DRLWeightedScorer:
             # Start-of-pass snapshot: every update this pass bootstraps from
             # these values (fitted-value iteration — one effective Bellman
             # step per entry per pass, geometric contraction to the fixpoint).
+            # Deployed-basis fidelity (AGI cycle H20260922150119): the
+            # deployed estimator is the double-Q AVERAGE (q_value + q_value_b)
+            # / 2 — the same basis _get_drl_weight_adjustments scores with.
+            # Snapshotting (and writing) only q_value left q_value_b stale at
+            # its pre-replay value, halving every replayed adjustment in the
+            # deployed weights.  Replay therefore bootstraps from the
+            # deployed average and mirrors each update into BOTH estimators:
+            # the fitted-value iteration has no maximisation operator (the
+            # bootstrap bucket is outcome-driven, not argmax), so there is no
+            # double-Q selection bias to trade off against — keeping A == B
+            # simply makes the learned basis identical to the scoring basis.
             q_snapshot: Dict[Tuple[str, str, int], float] = {
-                (row["regime_bucket"], row["source"], row["streak_bucket"]): row["q_value"]
+                (row["regime_bucket"], row["source"], row["streak_bucket"]): row["avg_q"]
                 for row in conn.execute(
-                    "SELECT regime_bucket, source, streak_bucket, q_value FROM drl_qtable"
+                    "SELECT regime_bucket, source, streak_bucket, "
+                    "(q_value + q_value_b) / 2.0 AS avg_q FROM drl_qtable"
                 ).fetchall()
             }
 
@@ -1553,11 +1568,13 @@ class DRLWeightedScorer:
                 epoch_movements.append(abs(new_q - old_q))
 
                 conn.execute(
-                    "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, q_value) "
-                    "VALUES (?, ?, ?, ?) "
+                    "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, "
+                    "q_value, q_value_b) "
+                    "VALUES (?, ?, ?, ?, ?) "
                     "ON CONFLICT(regime_bucket, source, streak_bucket) "
-                    "DO UPDATE SET q_value = excluded.q_value",
-                    (regime_bucket, source, streak_bucket, new_q),
+                    "DO UPDATE SET q_value = excluded.q_value, "
+                    "q_value_b = excluded.q_value_b",
+                    (regime_bucket, source, streak_bucket, new_q, new_q),
                 )
 
             conn.commit()
