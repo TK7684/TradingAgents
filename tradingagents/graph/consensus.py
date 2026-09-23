@@ -1206,7 +1206,22 @@ class DRLWeightedScorer:
             # replacing the degenerate max_Q(s',a') = 0 shortcut that collapsed
             # the Bellman equation into a plain EMA and left discount_factor
             # dormant in the TD error (AGI cycle H20260826150153).
-            boot_correct = predicted == actual and predicted != "HOLD"
+            # Per-source credit assignment (crystallized learning
+            # EXP-20260729-PER-SOURCE-REWARD, and replay parity): each
+            # source's streak bucket advances only on ITS OWN correct
+            # directional call — not on the group consensus verdict.
+            # A source wrong while the group was right must reset to
+            # bucket 0 (self-transition), exactly as replay does; the old
+            # group-verdict rule trained transitions its own policy never
+            # earned (online-vs-replay basis gap, H20260923150120).
+            src_sig = source_signals.get(source)
+            src_sig_up = src_sig.upper() if src_sig is not None else None
+            if src_sig_up is None:
+                # No recorded signal for this source: fall back to the
+                # group verdict (replay-parity default).
+                boot_correct = predicted == actual and predicted != "HOLD"
+            else:
+                boot_correct = src_sig_up == actual and src_sig_up != "HOLD"
             next_bucket = _discretize_streak(streak + 1) if boot_correct else 0
             if next_bucket == streak_bucket:
                 # self-transition: bootstrap from the current averaged estimate

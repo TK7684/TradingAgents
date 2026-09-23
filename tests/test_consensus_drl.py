@@ -1975,3 +1975,117 @@ class TestDoubleQBootstrap:
         assert rows["avg_q"] < 0.5, (
             f"averaged Q ratcheted to {rows['avg_q']} under zero-mean rewards"
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-source online bootstrap fidelity (H20260923150120)
+# ---------------------------------------------------------------------------
+
+class TestPerSourceOnlineBootstrap:
+    """The online record_reward TD bootstrap must use each source's OWN
+    signal to advance/reset its streak bucket — exactly as
+    optimize_weights_from_history (replay) does, and per crystallized
+    learning EXP-20260729-PER-SOURCE-REWARD ("each agent must be evaluated
+    on its OWN policy/output, not the group consensus").
+
+    Old behaviour: the group consensus verdict advanced the streak bucket
+    of EVERY source, so a source that was wrong while the group was right
+    was trained on a transition (streak -> streak+1) its own policy never
+    earned — an online-vs-replay basis gap.
+    """
+
+    REGIME = 0.01  # -> "neutral" bucket
+
+    @staticmethod
+    def _seed_bucket1(conn, avg_q=0.8):
+        """Seed Q=(A=B=avg_q) at (neutral, source, streak_bucket=1) so the
+        bootstrap value differs from the unseeded bucket 0 (=0.0)."""
+        for src in SOURCES:
+            conn.execute(
+                "INSERT INTO drl_qtable (regime_bucket, source, streak_bucket, "
+                "q_value, q_value_b, visit_count, eligibility) "
+                "VALUES ('neutral', ?, 1, ?, ?, 50, 0.0) "
+                "ON CONFLICT(regime_bucket, source, streak_bucket) "
+                "DO UPDATE SET q_value = ?, q_value_b = ?",
+                (src, avg_q, avg_q, avg_q, avg_q),
+            )
+        conn.commit()
+
+    def test_wrong_source_while_group_right_gets_lower_td_target(self, drl_scorer):
+        """A SELL-voting source in a correct BUY consensus must bootstrap
+        from its OWN reset bucket (self-transition), not the group's
+        advanced bucket — so its single-step Q update is strictly smaller
+        than a correct-voting source's."""
+        import random as _r
+        _r.seed(42)
+        signals = {src: "BUY" for src in SOURCES}
+        signals["trader"] = "SELL"  # wrong while group right
+
+        conn = drl_scorer._tracker._get_conn()
+        self._seed_bucket1(conn, avg_q=0.8)
+
+        drl_scorer.record_reward(
+            ticker="AAPL", date_str="2026-09-23",
+            source_signals=signals,
+            predicted_signal="BUY", actual_signal="BUY",
+            regime_return=self.REGIME,
+        )
+
+        rows = {
+            row["source"]: row["avg_q"]
+            for row in conn.execute(
+                "SELECT source, (q_value + q_value_b) / 2.0 AS avg_q "
+                "FROM drl_qtable WHERE regime_bucket = 'neutral' "
+                "AND streak_bucket = 0"
+            ).fetchall()
+        }
+        assert "trader" in rows, "trader row missing at bucket 0"
+        for src in SOURCES:
+            if src == "trader":
+                continue
+            assert rows[src] > rows["trader"] + 1e-6, (
+                f"wrong-while-group-right source ({rows['trader']:.4f}) must "
+                f"bootstrap lower than correct source {src} ({rows[src]:.4f})"
+            )
+
+    def test_online_td_target_matches_replay_basis_exactly(self, drl_scorer):
+        """Numeric fidelity: with lr=0.15, gamma=0.9, seeded bucket-1 Q=0.8
+        and a fresh bucket-0 Q=0, one online update must give
+        - correct source (BUY): avg_q = lr * (1 + gamma*0.8) / 2
+        - wrong source (SELL):  avg_q = lr * (1 + gamma*0.0) / 2  (self-transition)
+        i.e. exactly the TD targets replay would compute per-source."""
+        import random as _r
+        _r.seed(7)
+        signals = {src: "BUY" for src in SOURCES}
+        signals["trader"] = "SELL"
+
+        conn = drl_scorer._tracker._get_conn()
+        self._seed_bucket1(conn, avg_q=0.8)
+
+        drl_scorer.record_reward(
+            ticker="AAPL", date_str="2026-09-23",
+            source_signals=signals,
+            predicted_signal="BUY", actual_signal="BUY",
+            regime_return=self.REGIME,
+        )
+
+        rows = {
+            row["source"]: row["avg_q"]
+            for row in conn.execute(
+                "SELECT source, (q_value + q_value_b) / 2.0 AS avg_q "
+                "FROM drl_qtable WHERE regime_bucket = 'neutral' "
+                "AND streak_bucket = 0"
+            ).fetchall()
+        }
+        lr = drl_scorer.learning_rate
+        g = drl_scorer.discount_factor
+        correct_expected = lr * (1.0 + g * 0.8) / 2.0   # boot from bucket 1
+        wrong_expected = lr * (1.0 + g * 0.0) / 2.0     # self-transition, Q0=0
+        assert rows["investment_judge"] == pytest.approx(correct_expected), (
+            f"correct source: expected {correct_expected:.4f}, "
+            f"got {rows['investment_judge']:.4f}"
+        )
+        assert rows["trader"] == pytest.approx(wrong_expected), (
+            f"wrong source: expected {wrong_expected:.4f} (self-transition), "
+            f"got {rows['trader']:.4f} (group-verdict bootstrap leaked)"
+        )
