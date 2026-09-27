@@ -611,6 +611,16 @@ class AccuracyTracker:
                 "total": row["total_predictions"],
                 "correct": row["correct_predictions"],
                 "accuracy": row["accuracy"],
+                # Display-vs-decision-basis consistency: gating (get_weights)
+                # ranks sources by Wilson LB, so expose the same shrunk value
+                # alongside the raw accuracy column.
+                "shrunk_accuracy": round(
+                    _wilson_lower_bound(
+                        int(row["correct_predictions"]),
+                        int(row["total_predictions"]),
+                    ),
+                    4,
+                ),
             }
             for row in rows
         }
@@ -640,6 +650,11 @@ class AccuracyTracker:
                 "total": row["total"],
                 "correct": row["correct"],
                 "accuracy": row["accuracy"],
+                # Same shrinkage convention as get_source_stats / get_weights.
+                "shrunk_accuracy": round(
+                    _wilson_lower_bound(int(row["correct"]), int(row["total"])),
+                    4,
+                ),
                 "buy_correct": row["buy_correct"],
                 "buy_total": row["buy_total"],
                 "sell_correct": row["sell_correct"],

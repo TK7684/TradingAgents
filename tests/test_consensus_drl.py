@@ -2089,3 +2089,71 @@ class TestPerSourceOnlineBootstrap:
             f"wrong source: expected {wrong_expected:.4f} (self-transition), "
             f"got {rows['trader']:.4f} (group-verdict bootstrap leaked)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Display-vs-decision-basis consistency: stats expose shrunk accuracy
+# ---------------------------------------------------------------------------
+
+class TestStatsShrunkAccuracy:
+    """get_source_stats/get_ticker_stats must expose the same Wilson-LB
+    shrunk accuracy that gates decisions (get_weights), not raw correct/total
+    alone — closing the last raw-accuracy display path (E20260913 learned
+    note; pattern: small-sample accuracy overfitting)."""
+
+    def test_source_stats_shrunk_matches_wilson(self, tracker):
+        for i in range(10):
+            date = f"2026-03-{i:03d}"
+            pred = "BUY"
+            actual = "BUY" if i == 0 else "SELL"   # 1/10 correct
+            tracker.record_prediction("STA", date, "trader", pred)
+            tracker.record_outcome("STA", date, actual)
+        stats = tracker.get_source_stats()["trader"]
+        assert stats["accuracy"] == pytest.approx(0.1, abs=1e-6)
+        assert stats["shrunk_accuracy"] == pytest.approx(
+            _wilson_lower_bound(1, 10), abs=1e-4
+        )
+
+    def test_source_stats_unseen_source_is_neutral(self, tracker):
+        # No graded predictions at all -> no rows; after grading one source
+        # the OTHER sources may appear with 0/0 -> shrunk must be 0.5, not 0.
+        tracker.record_prediction("STA2", "2026-04-01", "trader", "BUY")
+        tracker.record_outcome("STA2", "2026-04-01", "BUY")
+        for src, s in tracker.get_source_stats().items():
+            if s["total"] == 0:
+                assert s["shrunk_accuracy"] == 0.5
+
+    def test_source_stats_raw_fields_preserved(self, tracker):
+        tracker.record_prediction("STA3", "2026-04-02", "risk_judge", "BUY")
+        tracker.record_outcome("STA3", "2026-04-02", "BUY")
+        s = tracker.get_source_stats()["risk_judge"]
+        assert set(s) >= {"total", "correct", "accuracy", "shrunk_accuracy"}
+        assert (s["total"], s["correct"]) == (1, 1)
+
+    def test_ticker_stats_shrunk_matches_wilson(self, tracker):
+        for i in range(8):
+            date = f"2026-05-{i:03d}"
+            pred = "BUY"
+            actual = "BUY" if i < 4 else "SELL"   # 4/8 correct
+            tracker.record_prediction("TIC", date, "trader", pred)
+            tracker.record_outcome("TIC", date, actual)
+        s = tracker.get_ticker_stats()["TIC"]
+        assert s["accuracy"] == pytest.approx(0.5, abs=1e-6)
+        assert s["shrunk_accuracy"] == pytest.approx(
+            _wilson_lower_bound(4, 8), abs=1e-4
+        )
+
+    def test_stats_shrunk_consistent_with_weight_basis(self, tracker):
+        """The same statistical footing must underpin both display and gating."""
+        for i in range(30):
+            date = f"2026-06-{i:03d}"
+            pred = "BUY"
+            actual = "BUY" if i % 3 else "SELL"   # 20/30 correct
+            tracker.record_prediction("CON", date, "trader", pred)
+            tracker.record_outcome("CON", date, actual)
+        s = tracker.get_source_stats()["trader"]
+        w = tracker.get_weights()
+        # weight ratio between trader and an unseen source should be driven
+        # by Wilson LB values, i.e. shrunk_accuracy, not raw accuracy.
+        assert s["shrunk_accuracy"] < s["accuracy"]  # shrunk below raw at 20/30
+        assert w["trader"] > MIN_WEIGHT  # proven source keeps weight above floor
