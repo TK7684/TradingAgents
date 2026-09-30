@@ -121,6 +121,33 @@ FORWARD_GATE_WINDOW: int = 20
 #: lb = (p + z^2/(2n) - z*sqrt(p(1-p)/n + z^2/(4n^2))) / (1 + z^2/n)
 WILSON_Z: float = 1.96
 
+
+# Entity-aware cross-reference validation (AGI H20260930, knowledge-graph
+# hypothesis): a source text dominated by mentions of a *different* ticker
+# than the company under analysis is entity-contaminated (the extraction
+# pulled a verdict about another asset).  Detect it by counting explicit
+# ticker-symbol mentions and flag the extraction so the scorer can discount
+# its vote instead of letting a foreign verdict drive consensus.
+#: Min mentions of the analysed ticker for cross-reference to bind.
+ENTITY_MIN_TICKER_MENTIONS: int = 1
+#: Dominance ratio: other-ticker mentions / analysed-ticker mentions.
+ENTITY_DOMINANCE_RATIO: float = 3.0
+#: Confidence penalty applied when the winning tier's signal is contaminated.
+ENTITY_MISMATCH_PENALTY: float = 0.10
+_RE_TICKER_MENTION = re.compile(r"\b([A-Z]{1,5})\b")
+#: Common English/prose tokens excluded from ticker-mention counting.
+_ENTITY_STOPWORDS = frozenset({
+    "A", "I", "AN", "AS", "AT", "BE", "BY", "DO", "GO", "HE", "IF", "IN",
+    "IS", "IT", "ME", "MY", "NO", "OF", "ON", "OR", "SO", "TO", "UP", "US",
+    "WE", "BUY", "HOLD", "SELL", "THE", "AND", "FOR", "NOT", "ARE", "BUT",
+    "CAN", "HAS", "HAD", "HER", "HIM", "HIS", "HOW", "ITS", "NEW", "NOW",
+    "OLD", "ONE", "OUR", "OUT", "OWN", "SAY", "SEE", "SHE", "TWO", "WAY",
+    "WHO", "WHY", "YES", "YOU", "OVERWEIGHT", "UNDERWEIGHT", "STRONG",
+    "CAUTIOUS", "DECISION", "VERDICT", "RATING", "RISK", "HIGH", "LOW",
+    "SPY", "ETF", "NYSE", "IPO", "CEO", "CFO", "FDA", "AI", "ML", "Q1",
+    "Q2", "Q3", "Q4", "USD", "EUR", "GBP", "JPY", "EOD", "APR", "APIS",
+})
+
 # Experience-Replay optimization (arxiv:2607.18001 RL reward optimisation loop):
 # Replays graded historical predictions through the Q-learning update until
 # the mean |TD error| converges, so weights are optimised from *all* past
@@ -232,6 +259,9 @@ class ExtractionResult:
     signal: str  # BUY, HOLD, or SELL (normalised)
     raw_text: str
     extraction_method: str  # which pattern or fallback method matched
+    #: True when the source text is dominated by another ticker's symbol —
+    #: the extracted verdict is probably about a *different* entity.
+    entity_mismatch: bool = False
 
 
 @dataclass
@@ -305,6 +335,7 @@ class ConsensusSignalExtractor:
             Mapping of source name to :class:`ExtractionResult`.
         """
         results: Dict[str, ExtractionResult] = {}
+        ticker = str(state.get("company_of_interest", "") or "").upper()
 
         # 1. Investment Debate Judge
         raw = ""
@@ -338,6 +369,11 @@ class ConsensusSignalExtractor:
             log.warning("Could not access final_trade_decision")
         results["portfolio_manager"] = self._make_extraction(raw)
 
+        # Entity-aware cross-reference validation: flag extractions whose
+        # source text is dominated by a different ticker's symbol.
+        for src_name, ext in results.items():
+            ext.entity_mismatch = self._entity_mismatch(ext.raw_text, ticker)
+
         return results
 
     def _make_extraction(self, raw: Any) -> ExtractionResult:
@@ -350,6 +386,38 @@ class ConsensusSignalExtractor:
             raw_text=raw_str[:500],  # cap for logging/storage
             extraction_method=method,
         )
+
+    @staticmethod
+    def _entity_mismatch(raw_text: str, ticker: str) -> bool:
+        """Cross-reference *raw_text* against the analysed *ticker*.
+
+        Counts explicit uppercase token mentions (1–5 letters, word-bounded —
+        a lightweight stand-in for a full entity graph).  The extraction is
+        entity-contaminated when the analysed ticker is barely mentioned
+        while some *other* token dominates by :data:`ENTITY_DOMINANCE_RATIO`.
+
+        Common English words and signal vocabulary are excluded so prose like
+        "BUY AAPL" does not trip on "BUY".  Returns False when the ticker is
+        unknown (nothing to cross-reference against).
+        """
+        if not raw_text or not ticker or ticker == "UNKNOWN":
+            return False
+        ticker_u = ticker.upper()
+        counts: Dict[str, int] = {}
+        for tok in _RE_TICKER_MENTION.findall(raw_text):
+            if tok in _ENTITY_STOPWORDS:
+                continue
+            counts[tok] = counts.get(tok, 0) + 1
+        mine = counts.get(ticker_u, 0)
+        if mine >= ENTITY_MIN_TICKER_MENTIONS:
+            return False
+        # Ticker never mentioned: flag only if a single other token dominates
+        # the text (>=3 mentions) — otherwise the text is generic prose.
+        if counts:
+            top_tok, top_n = max(counts.items(), key=lambda kv: kv[1])
+            if top_tok != ticker_u and top_n >= ENTITY_DOMINANCE_RATIO:
+                return True
+        return False
 
 
 
@@ -785,6 +853,37 @@ class ConfidenceScorer:
             # SELL won despite disagreement — mildly reward contrarian conviction
             buy_correction -= DISAGREEMENT_PENALTY * 0.25
 
+        # --- Entity-mismatch correction (cross-reference validation) ---
+        # If the sources backing the winning signal are entity-contaminated
+        # (their text was about a different ticker), discount confidence —
+        # one penalty per contaminated tier that voted with the winner.
+        entity_correction = 0.0
+        if source_extractions:
+            contaminated = [
+                src for src, ext in source_extractions.items()
+                if getattr(ext, "entity_mismatch", False)
+            ]
+            if contaminated:
+                winning_tier_sources = set()
+                if ij_signal == final_signal:
+                    winning_tier_sources.add("investment_judge")
+                if exec_signal == final_signal:
+                    winning_tier_sources.update(
+                        ("trader", "risk_judge", "portfolio_manager")
+                    )
+                contaminated_winners = [
+                    s for s in contaminated if s in winning_tier_sources
+                ]
+                if contaminated_winners:
+                    entity_correction = ENTITY_MISMATCH_PENALTY * len(
+                        contaminated_winners
+                    )
+                    log.info(
+                        "Entity mismatch: %s contaminated source(s) backed the "
+                        "winning %s signal (-%.2f)",
+                        contaminated_winners, final_signal, entity_correction,
+                    )
+
         # --- Market regime correction ---
         regime_ret = get_market_regime()
         regime_correction = 0.0
@@ -798,7 +897,19 @@ class ConfidenceScorer:
                 regime_ret * 100, regime_correction,
             )
 
-        confidence = max(0.0, min(1.0, round(consensus_level - buy_correction - regime_correction, 4)))
+        confidence = max(
+            0.0,
+            min(
+                1.0,
+                round(
+                    consensus_level
+                    - buy_correction
+                    - regime_correction
+                    - entity_correction,
+                    4,
+                ),
+            ),
+        )
 
         recommendation = self._build_recommendation(final_signal, confidence, unanimous)
 

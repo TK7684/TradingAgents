@@ -2157,3 +2157,91 @@ class TestStatsShrunkAccuracy:
         # by Wilson LB values, i.e. shrunk_accuracy, not raw accuracy.
         assert s["shrunk_accuracy"] < s["accuracy"]  # shrunk below raw at 20/30
         assert w["trader"] > MIN_WEIGHT  # proven source keeps weight above floor
+
+
+# ---------------------------------------------------------------------------
+# Entity-aware cross-reference validation (AGI H20260930)
+# ---------------------------------------------------------------------------
+
+class TestEntityCrossRefValidation:
+    """Knowledge-graph hypothesis: cross-reference source text against the
+    analysed ticker; discount confidence when the winning tier's text was
+    about a different entity."""
+
+    def test_entity_mismatch_detected_on_foreign_ticker_dominance(self):
+        from tradingagents.graph.consensus import ConsensusSignalExtractor
+        ext = ConsensusSignalExtractor()
+        # NVDA mentioned 4x, AAPL (analysed) never
+        text = "NVDA earnings beat: NVDA up 8% on datacenter. NVDA momentum NVDA strong. Rating: BUY"
+        assert ext._entity_mismatch(text, "AAPL") is True
+
+    def test_no_mismatch_when_ticker_mentioned(self):
+        from tradingagents.graph.consensus import ConsensusSignalExtractor
+        ext = ConsensusSignalExtractor()
+        text = "NVDA NVDA NVDA NVDA but we analyse AAPL. Rating: BUY"
+        assert ext._entity_mismatch(text, "AAPL") is False
+
+    def test_no_mismatch_on_generic_prose(self):
+        from tradingagents.graph.consensus import ConsensusSignalExtractor
+        ext = ConsensusSignalExtractor()
+        text = "Decision: BUY based on strong fundamentals and momentum across the sector."
+        assert ext._entity_mismatch(text, "AAPL") is False
+
+    def test_extract_from_state_sets_entity_mismatch_flag(self):
+        from tradingagents.graph.consensus import ConsensusSignalExtractor
+        ext = ConsensusSignalExtractor()
+        state = {
+            "company_of_interest": "AAPL",
+            "investment_debate_state": {"judge_decision": "NVDA NVDA NVDA NVDA surge. Decision: BUY"},
+            "trader_investment_decision": "Decision: SELL",
+            "risk_debate_state": {"judge_decision": "Decision: HOLD"},
+            "final_trade_decision": "Decision: BUY",
+        }
+        out = ext.extract_from_state(state)
+        assert out["investment_judge"].entity_mismatch is True
+        assert out["trader"].entity_mismatch is False
+
+    def test_scorer_discounts_contaminated_winning_tier(self, monkeypatch):
+        from tradingagents.graph import consensus as C
+        monkeypatch.setattr(C, "get_market_regime", lambda: 0.0)
+        scorer = C.ConfidenceScorer(C.AccuracyTracker(":memory:"))
+        # investment_judge text dominated by NVDA, votes BUY; exec block clean BUY
+        source_signals = {
+            "investment_judge": "BUY", "trader": "BUY",
+            "risk_judge": "BUY", "portfolio_manager": "BUY",
+        }
+        extractions = {
+            src: C.ExtractionResult(
+                signal=sig, raw_text="NVDA NVDA NVDA NVDA boom Decision: BUY" if src == "investment_judge" else "Decision: BUY",
+                extraction_method="regex_decision",
+                entity_mismatch=(src == "investment_judge"),
+            )
+            for src, sig in source_signals.items()
+        }
+        res = scorer.score(source_signals, extractions)
+        # BUY unanimous: 1.0 - 0.15 (BUY_UNANIMITY_DISCOUNT) - 0.10 (entity) = 0.75
+        assert res.confidence == 0.75, res.confidence
+
+    def test_scorer_no_penalty_when_contaminated_source_lost(self, monkeypatch):
+        from tradingagents.graph import consensus as C
+        monkeypatch.setattr(C, "get_market_regime", lambda: 0.0)
+        scorer = C.ConfidenceScorer(C.AccuracyTracker(":memory:"))
+        # Contaminated ij says BUY but exec tier (0.4+ij tie?) — make exec SELL majority win impossible;
+        # simplest: contaminated source's tier is NOT the winning tier.
+        source_signals = {
+            "investment_judge": "SELL", "trader": "BUY",
+            "risk_judge": "BUY", "portfolio_manager": "BUY",
+        }
+        # exec majority BUY (0.4) vs ij SELL (0.6) → SELL wins; contaminated exec sources lost
+        extractions = {
+            src: C.ExtractionResult(
+                signal=sig, raw_text="NVDA NVDA NVDA NVDA boom Decision: BUY" if src != "investment_judge" else "Decision: SELL",
+                extraction_method="regex_decision",
+                entity_mismatch=(src != "investment_judge"),
+            )
+            for src, sig in source_signals.items()
+        }
+        res = scorer.score(source_signals, extractions)
+        # SELL won (ij 0.6); contaminated exec sources did NOT back winner:
+        # no entity penalty; SELL-despite-disagreement bonus +0.25*0.25=0.0625
+        assert res.confidence == 0.6625, res.confidence
