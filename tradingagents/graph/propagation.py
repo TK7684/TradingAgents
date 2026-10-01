@@ -48,6 +48,7 @@ class Propagator:
                 }
             ),
             "market_report": "",
+            "polymarket_report": "",
             "fundamentals_report": "",
             "sentiment_report": "",
             "news_report": "",
