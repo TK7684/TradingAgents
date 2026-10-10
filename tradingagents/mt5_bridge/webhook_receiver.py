@@ -23,6 +23,14 @@ from flask import Flask, request, jsonify
 
 log = logging.getLogger(__name__)
 
+# Dormant-module activation (AGI exp/pine-templates-activation):
+# tv_screener/pine_templates.py had zero importers -- its Pine Script alert
+# templates target THIS webhook receiver (port 5001), so serve them here.
+from tradingagents.tv_screener.pine_templates import (
+    TEMPLATES as PINE_TEMPLATES,
+    TEMPLATE_DESCRIPTIONS as PINE_DESCRIPTIONS,
+)
+
 # In-memory signal queue (thread-safe)
 _signal_queue: list[dict[str, Any]] = []
 _queue_lock = Lock()
@@ -147,6 +155,36 @@ def create_webhook_app(queue: list[dict[str, Any]] | None = None,
                 signal = _q.pop(0)
                 return jsonify({"status": "dequeued", "signal": signal})
             return jsonify({"status": "empty"}), 204
+
+
+    @app.route("/pine-templates", methods=["GET"])
+    def pine_templates_index():
+        """List available Pine Script alert templates (dormant library activation)."""
+        return jsonify({
+            "count": len(PINE_TEMPLATES),
+            "templates": {
+                name: {"description": PINE_DESCRIPTIONS.get(name, ""),
+                       "length": len(code)}
+                for name, code in PINE_TEMPLATES.items()
+            },
+            "usage": "GET /pine-templates/<name> for the full Pine source; "
+                     "set the alert webhook to /webhook/tradingview",
+        })
+
+    @app.route("/pine-templates/<name>", methods=["GET"])
+    def pine_templates_get(name):
+        """Serve a full Pine Script template by name (404 on unknown)."""
+        code = PINE_TEMPLATES.get(name)
+        if code is None:
+            return jsonify({
+                "error": "unknown template",
+                "available": sorted(PINE_TEMPLATES.keys()),
+            }), 404
+        return jsonify({
+            "name": name,
+            "description": PINE_DESCRIPTIONS.get(name, ""),
+            "pine": code,
+        })
 
     return app
 

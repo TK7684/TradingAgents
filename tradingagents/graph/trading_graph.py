@@ -53,7 +53,7 @@ class TradingAgentsGraph:
 
     def __init__(
         self,
-        selected_analysts=["market", "social", "news", "fundamentals"],
+        selected_analysts=["market", "social", "news", "fundamentals", "polymarket"],
         debug=False,
         config: Dict[str, Any] = None,
         callbacks: Optional[List] = None,

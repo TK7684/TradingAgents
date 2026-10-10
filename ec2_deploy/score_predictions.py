@@ -18,6 +18,28 @@ sys.path.insert(0, os.path.expanduser("~/TradingAgents"))
 
 import yfinance as yf
 
+# --- Transaction-cost-aware grading (AGI H2026100515151) ---
+# arxiv:2605.19337: only 1/19 LLM trading papers model transaction costs.
+# A directional call is only 'correct' if the move clears the round-trip
+# cost on top of the noise band -- net edge, not raw price change.
+ROUND_TRIP_COST = 0.002  # 20 bps round-trip (spread + slippage, both legs)
+
+
+def grade_move(pct_change: float, threshold: float = 0.02,
+               round_trip_cost: float = ROUND_TRIP_COST) -> str:
+    """Grade a realized move net of round-trip transaction costs.
+
+    BUY requires pct_change > threshold + cost (net gain after costs);
+    SELL requires pct_change < -(threshold + cost);
+    otherwise HOLD.
+    """
+    eff = threshold + round_trip_cost
+    if pct_change > eff:
+        return "BUY"
+    elif pct_change < -eff:
+        return "SELL"
+    return "HOLD"
+
 
 def get_actual_signal(ticker: str, date_str: str, horizon_days: int = 5) -> tuple[str, dict]:
     """Determine the 'correct' signal based on N-day price movement.
@@ -72,14 +94,10 @@ def get_actual_signal(ticker: str, date_str: str, horizon_days: int = 5) -> tupl
         pct_change = (close_N - close_0) / close_0
         details["pct_change"] = round(pct_change * 100, 2)
 
-        # Threshold: 2% over 5 days (more robust than 1% over 1 day)
-        threshold = 0.02
-        if pct_change > threshold:
-            return "BUY", details
-        elif pct_change < -threshold:
-            return "SELL", details
-        else:
-            return "HOLD", details
+        # Threshold: 2% over 5 days, adjusted for round-trip transaction
+        # costs so marginal sub-cost 'wins' grade as HOLD (H20261005150151)
+        details["round_trip_cost"] = ROUND_TRIP_COST
+        return grade_move(pct_change), details
 
     except Exception as e:
         print(f"  Error getting price for {ticker}: {e}")
