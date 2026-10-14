@@ -1685,6 +1685,8 @@ class DRLWeightedScorer:
 
             epoch_td_errors: list = []
             epoch_movements: list = []
+            # Per-state Expected-SARSA accumulator: key -> [sum(isw*td), sum(isw)]
+            updates: Dict[Tuple[str, str, int], list] = {}
 
             for idx in selected:
                 reward, regime_bucket, source, streak_bucket, next_bucket = (
@@ -1703,9 +1705,36 @@ class DRLWeightedScorer:
 
                 td_error = reward + self.discount_factor * next_q - old_q
                 priorities[idx] = abs(td_error)
-                step = self.learning_rate * td_error * is_weight.get(idx, 1.0)
-                new_q = old_q + step
                 epoch_td_errors.append(abs(td_error))
+
+                # Expected-SARSA accumulation (van Seijen & Sutton 2009; AGI
+                # cycle H20261014150000): a state visited by MULTIPLE
+                # transitions in one pass must receive the *expected* Bellman
+                # update — the probability-weighted mean over its observed
+                # branches — not a last-write-wins collage of individually
+                # sampled targets.  The old rule wrote each transition
+                # immediately (new_q = old_q + lr*td_i from the same snapshot
+                # old_q), so the chronologically LAST transition silently
+                # overwrote its siblings: mixed continue/reset states
+                # collapsed to the last-sampled branch's target (a different
+                # fixed point than online record_reward converges to, and
+                # mean |TD| plateaued forever at the branch spread ->
+                # converged=False at max_epochs).  Phase 1 accumulates
+                # importance-sampling-weighted TD sums per state; phase 2
+                # applies ONE averaged step per state.  With a single
+                # transition per state the mean degenerates to that
+                # transition's TD error, so homogeneous histories keep the
+                # exact analytic fixed points (Q* = r/(1-gamma)).
+                isw = is_weight.get(idx, 1.0)
+                acc = updates.setdefault(key, [0.0, 0.0])
+                acc[0] += isw * td_error
+                acc[1] += isw
+
+            for key, (td_sum, w_sum) in updates.items():
+                regime_bucket, source, streak_bucket = key
+                old_q = q_snapshot.get(key, 0.0)
+                mean_td = td_sum / w_sum if w_sum > 0 else 0.0
+                new_q = old_q + self.learning_rate * mean_td
                 epoch_movements.append(abs(new_q - old_q))
 
                 conn.execute(

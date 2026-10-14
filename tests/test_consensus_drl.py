@@ -1112,6 +1112,72 @@ class TestReplayOptimization:
 # Self-Play Gate Tests (AGI cycle H20260907150301)
 # ---------------------------------------------------------------------------
 
+    def test_replay_expected_sarsa_mixed_branch_fixed_point(self, tracker, drl_scorer):
+        """Mixed continue/reset branches from one state must converge to the
+        EXPECTED Bellman fixed point (van Seijen & Sutton 2009) — the same
+        fixed point the online record_reward path reaches on identical data.
+
+        Setup: consensus always correct (3 sources vote with the actual),
+        risk_judge alternates correct/wrong so its bucket-1/2/3 states see
+        both the continue (next bucket) and reset (bucket 0) branch. Every
+        transition carries the consensus reward +1.
+
+        Analytic expected fixed points (gamma=0.9; Q_0=Q_4 stay 0, never
+        written as from-states):
+            Q_3 = 1 + gamma*Q_4                 = 1.0   (single branch)
+            Q_2 = (1/3)(1+gamma*Q_3)+(2/3)(1)   = 1.3
+            Q_1 = (1/2)(1+gamma*Q_2)+(1/2)(1)   = 1.585
+        The snapshot-replay rule let the chronologically LAST transition
+        win each state's write (last-write-wins), collapsing every mixed
+        state to 1.0 — a different fixed point than online converges to.
+        """
+        import math as _math
+
+        for i in range(6):
+            date = f"2026-10-{i+1:02d}"
+            signals = {
+                "investment_judge": "BUY",
+                "trader": "BUY",
+                "risk_judge": "BUY" if i % 2 == 0 else "SELL",
+                "portfolio_manager": "BUY",
+            }
+            for source, sig in signals.items():
+                tracker.record_prediction("AAPL", date, source, sig)
+            tracker.record_outcome("AAPL", date, "BUY")
+
+        result = drl_scorer.optimize_weights_from_history(max_epochs=800)
+        assert result["converged"] is True
+
+        gamma = drl_scorer.discount_factor
+        conn = tracker._get_conn()
+
+        def q(source: str, bucket: int) -> float:
+            row = conn.execute(
+                "SELECT (q_value + q_value_b)/2.0 AS aq FROM drl_qtable "
+                "WHERE regime_bucket='neutral' AND source=? AND streak_bucket=?",
+                (source, bucket),
+            ).fetchone()
+            return row["aq"] if row else 0.0
+
+        exp_3 = 1.0 + gamma * q("risk_judge", 4)  # single continue branch
+        exp_2 = (1.0 / 3.0) * (1.0 + gamma * exp_3) + (2.0 / 3.0) * (
+            1.0 + gamma * q("risk_judge", 0)
+        )
+        exp_1 = 0.5 * (1.0 + gamma * exp_2) + 0.5 * (
+            1.0 + gamma * q("risk_judge", 0)
+        )
+        assert _math.isclose(q("risk_judge", 3), exp_3, rel_tol=0.02), (
+            f"Q(b3)={q('risk_judge', 3)} expected {exp_3}"
+        )
+        assert _math.isclose(q("risk_judge", 2), exp_2, rel_tol=0.02), (
+            f"Q(b2)={q('risk_judge', 2)} expected {exp_2}"
+        )
+        assert _math.isclose(q("risk_judge", 1), exp_1, rel_tol=0.02), (
+            f"Q(b1) must hold the expected-SARSA fixed point {exp_1:.3f}, "
+            f"got {q('risk_judge', 1):.3f} (last-write-wins collapse -> 1.0)"
+        )
+
+
 class TestSelfPlayGate:
     """Self-play tournament gate (arxiv:2609.04697 applied to forward-gating).
 
