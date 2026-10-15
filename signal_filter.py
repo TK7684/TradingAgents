@@ -30,6 +30,12 @@ MIN_PREDICTIONS = 20    # minimum predictions before blocking a ticker
 EB_PRIOR_MEAN = 0.5     # neutral prior mean (no data = coin flip)
 EB_PRIOR_STRENGTH = 5   # pseudo-observations pulling toward the prior
 
+# Recency weighting (non-stationary bandit convention): each prediction's
+# vote decays by half every RECENCY_HALF_LIFE_DAYS, so stale regimes stop
+# dominating the gate. Composed with EB shrinkage: weighted correct/total
+# feed the same beta-binomial prior (pseudo-observations carry weight 1).
+RECENCY_HALF_LIFE_DAYS = 60.0
+
 
 class SignalFilter:
     """Filter trading signals based on historical prediction accuracy."""
@@ -103,35 +109,71 @@ class SignalFilter:
     # ── Internal helpers ─────────────────────────────────────────────────
 
     def _ticker_accuracy(self, ticker: str) -> tuple[float, int]:
-        """Return (EB-shrunk accuracy_pct, total_predictions) for a ticker.
+        """Return (recency-weighted, EB-shrunk accuracy_pct, total_predictions).
 
-        accuracy = (correct + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN) /
-                   (n + EB_PRIOR_STRENGTH) * 100
+        Each prediction votes with weight 0.5 ** (age_days /
+        RECENCY_HALF_LIFE_DAYS); the weighted correct/total then feed the
+        beta-binomial shrinkage:
 
-        Small samples are pulled toward 50%, so a 1/1 ticker reads as
-        ~58.3% instead of 100%, and 2/8 reads as ~36.7% instead of 25%.
+        accuracy = (w_correct + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN) /
+                   (w_total + EB_PRIOR_STRENGTH) * 100
+
+        Equal timestamps reduce to the previous unweighted EB estimate.
+        Small samples are still pulled toward 50%.
         """
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute(
-            "SELECT COUNT(*), SUM(correct) FROM predictions WHERE ticker = ?",
-            (ticker,),
-        ).fetchone()
-        conn.close()
-        if not row or row[0] == 0:
+        w_correct, w_total, n = self._weighted_counts(ticker.upper())
+        if n == 0:
             return 50.0, 0  # no data = assume neutral
-        n = row[0]
-        correct = row[1] or 0
-        shrunk = (correct + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN) / (n + EB_PRIOR_STRENGTH)
+        shrunk = (w_correct + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN) / (
+            w_total + EB_PRIOR_STRENGTH
+        )
         return shrunk * 100, n
+
+    def _weighted_counts(self, ticker: str) -> tuple[float, float, int]:
+        """Recency-weighted (w_correct, w_total, raw_n) for a ticker.
+
+        Shared by the gate (_ticker_accuracy) and the stats display
+        (_query_ticker_stats) so display always equals the decision basis.
+        Unparseable/future timestamps fall back to full weight (safe).
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT correct, created_at FROM predictions WHERE ticker = ?",
+            (ticker,),
+        ).fetchall()
+        conn.close()
+        w_correct = w_total = 0.0
+        n = 0
+        for correct, created_at in rows:
+            n += 1
+            weight = 1.0
+            if created_at:
+                try:
+                    age_days = (now - datetime.fromisoformat(
+                        str(created_at).replace(" ", "T"))).total_seconds() / 86400.0
+                    if age_days > 0:
+                        weight = 0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)
+                except ValueError:
+                    pass
+            w_total += weight
+            if correct:
+                w_correct += weight
+        return w_correct, w_total, n
 
     def _anti_signal_consistency(self, ticker: str, signal: str) -> float:
         """Measure how often predictions disagree with actual outcomes.
 
         A high score means the system is consistently wrong (inverse signal).
+        Recency-weighted with the same decay as _ticker_accuracy: a ticker
+        whose inversion regime is stale (recovered) is not flagged forever,
+        while a currently-inverted ticker still is.
         """
         conn = sqlite3.connect(self.db_path)
         rows = conn.execute(
-            "SELECT predicted_signal, actual_signal, correct "
+            "SELECT predicted_signal, actual_signal, created_at "
             "FROM predictions WHERE ticker = ? "
             "AND predicted_signal != 'HOLD' AND actual_signal IS NOT NULL "
             "ORDER BY created_at DESC",
@@ -142,18 +184,30 @@ class SignalFilter:
         if len(rows) < MIN_PREDICTIONS:
             return 0.0
 
-        # Count cases where predicted direction was opposite to actual direction
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        # Weight cases where predicted direction was opposite to actual
         directional = {"BUY": 1, "SELL": -1, "HOLD": 0}
-        disagreements = 0
-        directional_count = 0
-        for pred_sig, act_sig, correct in rows:
+        disagreements = 0.0
+        directional_count = 0.0
+        for pred_sig, act_sig, created_at in rows:
             if pred_sig not in directional or act_sig not in directional:
                 continue
-            directional_count += 1
+            weight = 1.0
+            if created_at:
+                try:
+                    age_days = (now - datetime.fromisoformat(
+                        str(created_at).replace(" ", "T"))).total_seconds() / 86400.0
+                    if age_days > 0:
+                        weight = 0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)
+                except ValueError:
+                    pass
+            directional_count += weight
             if directional.get(pred_sig, 0) * directional.get(act_sig, 0) < 0:
-                disagreements += 1
+                disagreements += weight
 
-        return disagreements / max(directional_count, 1)
+        return disagreements / max(directional_count, 1e-9)
 
     def _worst_source_accuracy(self) -> tuple[str, float]:
         """Return (worst_source_name, worst_accuracy_pct).
@@ -187,19 +241,26 @@ class SignalFilter:
         small samples (AGI pattern: small-sample accuracy overfitting).
         """
         conn = sqlite3.connect(self.db_path)
-        prior_correct = EB_PRIOR_STRENGTH * EB_PRIOR_MEAN
-        rows = conn.execute(
-            "SELECT ticker, COUNT(*) as n, SUM(correct) as correct, "
-            "ROUND(100.0 * (SUM(correct) + ?) / (COUNT(*) + ?), 1) as wr "
-            "FROM predictions WHERE ticker NOT IN ('UNKNOWN', 'BTC') "
-            "GROUP BY ticker HAVING n >= 5 ORDER BY wr ASC",
-            (prior_correct, EB_PRIOR_STRENGTH),
-        ).fetchall()
+        tickers = [r[0] for r in conn.execute(
+            "SELECT DISTINCT ticker FROM predictions "
+            "WHERE ticker NOT IN ('UNKNOWN', 'BTC')"
+        ).fetchall()]
         conn.close()
-        return [
-            {"ticker": r[0], "predictions": r[1], "correct": r[2], "accuracy": r[3]}
-            for r in rows
-        ]
+        stats = []
+        for ticker in tickers:
+            w_correct, w_total, n = self._weighted_counts(ticker)
+            if n < 5:
+                continue
+            stats.append({
+                "ticker": ticker,
+                "predictions": n,
+                "correct": round(w_correct, 2),
+                "accuracy": round(
+                    100.0 * (w_correct + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN)
+                    / (w_total + EB_PRIOR_STRENGTH), 1),
+            })
+        stats.sort(key=lambda s: s["accuracy"])
+        return stats
 
 
 # ── Market Regime Check ────────────────────────────────────────────────────
