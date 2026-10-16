@@ -26,6 +26,14 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tradingagents.graph.consensus import _wilson_lower_bound
 
+
+def utc_now_naive():
+    """Naive UTC clock shared with signal_filter.py (parity: backtest grading
+    and live gating must compute 'now' with one convention)."""
+    from datetime import timezone
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 RESULTS_DIR = os.path.expanduser("~/TradingAgents/results/daily")
 BACKTEST_DIR = os.path.expanduser("~/TradingAgents/results/backtest")
@@ -110,7 +118,7 @@ def run_backtest(ticker_filter=None, period_days=None):
 
         date = data["date"]
         # Skip if too recent (need forward data)
-        days_ago = (datetime.now() - datetime.strptime(date, "%Y-%m-%d")).days
+        days_ago = (utc_now_naive() - datetime.strptime(date, "%Y-%m-%d")).days
         if days_ago < max(periods) + 5:
             print("Skipping {} (too recent for {}d backtest)".format(date, max(periods)))
             continue
@@ -165,7 +173,7 @@ def run_backtest(ticker_filter=None, period_days=None):
 
     # Save
     outfile = os.path.join(BACKTEST_DIR, "backtest_{}.json".format(
-        datetime.now().strftime("%Y-%m-%d")))
+        utc_now_naive().strftime("%Y-%m-%d")))
     with open(outfile, "w") as f:
         json.dump({"accuracy": accuracy, "total": len(all_scores),
                     "correct": correct, "wrong": wrong, "scores": all_scores}, f, indent=2)
