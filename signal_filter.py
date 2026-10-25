@@ -36,6 +36,14 @@ EB_PRIOR_STRENGTH = 5   # pseudo-observations pulling toward the prior
 # feed the same beta-binomial prior (pseudo-observations carry weight 1).
 RECENCY_HALF_LIFE_DAYS = 60.0
 
+# Hierarchical empirical prior: the shrinkage target is the pooled
+# recency-weighted accuracy of ALL tickers (meta-shrunk toward 0.5 by
+# EB_PRIOR_POOL_META pseudo-observations, then clamped) instead of a
+# fixed 50%. With a thin ticker sample the gate inherits the market-wide
+# base rate rather than a coin-flip assumption.
+EB_PRIOR_POOL_META = 10.0  # meta-shrinkage of the pooled prior toward 0.5
+PRIOR_CLAMP = (0.30, 0.70)  # empirical prior bounds (fail-safe band)
+
 
 class SignalFilter:
     """Filter trading signals based on historical prediction accuracy."""
@@ -124,10 +132,45 @@ class SignalFilter:
         w_correct, w_total, n = self._weighted_counts(ticker.upper())
         if n == 0:
             return 50.0, 0  # no data = assume neutral
-        shrunk = (w_correct + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN) / (
+        prior = self._pooled_prior()
+        shrunk = (w_correct + EB_PRIOR_STRENGTH * prior) / (
             w_total + EB_PRIOR_STRENGTH
         )
         return shrunk * 100, n
+
+    def _pooled_prior(self) -> float:
+        """Hierarchical EB prior: pooled recency-weighted accuracy across all
+        tickers, meta-shrunk toward EB_PRIOR_MEAN and clamped to PRIOR_CLAMP.
+        Falls back to EB_PRIOR_MEAN when no scored predictions exist."""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute(
+            "SELECT correct, created_at FROM predictions "
+            "WHERE correct IS NOT NULL"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return EB_PRIOR_MEAN
+        w_correct = w_total = 0.0
+        for correct, created_at in rows:
+            weight = 1.0
+            if created_at:
+                try:
+                    age_days = (now - datetime.fromisoformat(
+                        str(created_at).replace(" ", "T"))).total_seconds() / 86400.0
+                    if age_days > 0:
+                        weight = 0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS)
+                except ValueError:
+                    pass
+            w_total += weight
+            if correct:
+                w_correct += weight
+        pooled = (w_correct + EB_PRIOR_POOL_META * EB_PRIOR_MEAN) / (
+            w_total + EB_PRIOR_POOL_META
+        )
+        return min(max(pooled, PRIOR_CLAMP[0]), PRIOR_CLAMP[1])
 
     def _weighted_counts(self, ticker: str) -> tuple[float, float, int]:
         """Recency-weighted (w_correct, w_total, raw_n) for a ticker.
@@ -256,7 +299,7 @@ class SignalFilter:
                 "predictions": n,
                 "correct": round(w_correct, 2),
                 "accuracy": round(
-                    100.0 * (w_correct + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN)
+                    100.0 * (w_correct + EB_PRIOR_STRENGTH * self._pooled_prior())
                     / (w_total + EB_PRIOR_STRENGTH), 1),
             })
         stats.sort(key=lambda s: s["accuracy"])

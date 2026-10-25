@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from signal_filter import SignalFilter, EB_PRIOR_MEAN, EB_PRIOR_STRENGTH
+from signal_filter import (SignalFilter, EB_PRIOR_MEAN, EB_PRIOR_STRENGTH,
+                            EB_PRIOR_POOL_META)
 
 
 @pytest.fixture()
@@ -68,7 +69,9 @@ class TestEBShrinkage:
         conn.commit(); conn.close()
         acc, n = sf._ticker_accuracy("NVDA")
         assert n == 1
-        assert acc == pytest.approx((1 + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN)
+        # hierarchical: prior target = pooled base rate (here 1/1)
+        pooled = (1 + EB_PRIOR_POOL_META * EB_PRIOR_MEAN) / (1 + EB_PRIOR_POOL_META)
+        assert acc == pytest.approx((1 + EB_PRIOR_STRENGTH * pooled)
                                     / (1 + EB_PRIOR_STRENGTH) * 100)
 
     def test_tiny_bad_sample_is_shrunk_not_0(self, db):
@@ -80,7 +83,9 @@ class TestEBShrinkage:
         conn.commit(); conn.close()
         acc, n = sf._ticker_accuracy("AMD")
         assert n == 2
-        assert acc == pytest.approx(35.714, abs=0.01)
+        pooled = (0 + EB_PRIOR_POOL_META * EB_PRIOR_MEAN) / (2 + EB_PRIOR_POOL_META)
+        assert acc == pytest.approx((0 + EB_PRIOR_STRENGTH * pooled)
+                                    / (2 + EB_PRIOR_STRENGTH) * 100, abs=0.01)
         assert acc > 20  # above BLOCK threshold: no premature hard-block
 
     def test_large_sample_converges_to_raw(self, db):
@@ -94,7 +99,9 @@ class TestEBShrinkage:
         conn.commit(); conn.close()
         acc, n = sf._ticker_accuracy("T")
         assert n == 100
-        assert acc == pytest.approx(59.52, abs=0.01)
+        pooled = (60 + EB_PRIOR_POOL_META * EB_PRIOR_MEAN) / (100 + EB_PRIOR_POOL_META)
+        assert acc == pytest.approx((60 + EB_PRIOR_STRENGTH * pooled)
+                                    / (100 + EB_PRIOR_STRENGTH) * 100, abs=0.01)
         assert abs(acc - 60.0) < 1.0  # close to raw
 
     def test_blocking_still_works_on_genuinely_bad_history(self, db):
@@ -195,11 +202,12 @@ class TestStatsDisplayShrinkage:
         conn.close()
 
     def test_stats_accuracy_is_shrunk(self, db):
-        # 4/5 raw = 80%; EB = (4+2.5)/(5+5) = 65%
+        # 4/5 raw = 80%; hierarchical EB: pooled=(4+5)/(5+10)=0.6,
+        # acc = (4+5*0.6)/(5+5) = 70% — still shrunk well below raw 80%
         self._seed(db, "TSM", 4, 1)
         sf = SignalFilter(db_path=db)
         stats = {s["ticker"]: s for s in sf.get_ticker_stats()}
-        assert stats["TSM"]["accuracy"] == pytest.approx(65.0, abs=0.05)
+        assert stats["TSM"]["accuracy"] == pytest.approx(70.0, abs=0.05)
 
     def test_stats_raw_fields_preserved(self, db):
         self._seed(db, "TSM", 4, 1)
@@ -216,3 +224,44 @@ class TestStatsDisplayShrinkage:
         stats = {s["ticker"]: s for s in sf.get_ticker_stats()}
         gate_acc, _ = sf._ticker_accuracy("AMD")
         assert stats["AMD"]["accuracy"] == pytest.approx(gate_acc, abs=0.06)
+
+
+class TestHierarchicalPrior:
+    """The shrinkage target is the pooled base rate, not a fixed 50%."""
+
+    def test_empty_db_falls_back_to_neutral(self, db):
+        sf = SignalFilter(db_path=db)
+        assert sf._pooled_prior() == pytest.approx(0.5)
+
+    def test_all_bad_pool_clamps_low(self, db):
+        sf = SignalFilter(db_path=db)
+        conn = sqlite3.connect(db)
+        for _ in range(50):
+            _add_prediction(conn, "BAD", 0)
+        conn.commit(); conn.close()
+        assert sf._pooled_prior() == pytest.approx(0.30)  # PRIOR_CLAMP floor
+
+    def test_all_good_pool_clamps_high(self, db):
+        sf = SignalFilter(db_path=db)
+        conn = sqlite3.connect(db)
+        for _ in range(50):
+            _add_prediction(conn, "GOOD", 1)
+        conn.commit(); conn.close()
+        assert sf._pooled_prior() == pytest.approx(0.70)  # PRIOR_CLAMP ceiling
+
+    def test_ticker_gate_inherits_pool_base_rate(self, db):
+        """Thin ticker sample inside a bad pool reads below the old 50%-prior
+        value (hierarchical EB: market base rate dominates thin evidence)."""
+        sf = SignalFilter(db_path=db)
+        conn = sqlite3.connect(db)
+        for _ in range(40):
+            _add_prediction(conn, "OTHER", 0)   # pool base rate ~ (0+5)/(40+10)
+        _add_prediction(conn, "THIN", 1)        # 1/1 thin ticker
+        conn.commit(); conn.close()
+        pooled = sf._pooled_prior()
+        assert pooled < 0.5
+        acc, n = sf._ticker_accuracy("THIN")
+        assert n == 1
+        assert acc == pytest.approx((1 + EB_PRIOR_STRENGTH * pooled)
+                                    / (1 + EB_PRIOR_STRENGTH) * 100)
+        assert acc < 58.33  # strictly below the old fixed-prior estimate

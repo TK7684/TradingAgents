@@ -22,6 +22,7 @@ from signal_filter import (
     SignalFilter,
     EB_PRIOR_MEAN,
     EB_PRIOR_STRENGTH,
+    EB_PRIOR_POOL_META,
     RECENCY_HALF_LIFE_DAYS,
 )
 
@@ -157,7 +158,8 @@ class TestBackwardCompat:
         conn.close()
         sf = SignalFilter(db_path=db)
         acc, n = sf._ticker_accuracy("FLAT")
-        expected = (3 + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN) / (10 + EB_PRIOR_STRENGTH) * 100
+        pooled = (3 + EB_PRIOR_POOL_META * EB_PRIOR_MEAN) / (10 + EB_PRIOR_POOL_META)
+        expected = (3 + EB_PRIOR_STRENGTH * pooled) / (10 + EB_PRIOR_STRENGTH) * 100
         assert acc == pytest.approx(expected, abs=0.01)
 
     def test_half_life_constant_sanity(self):
