@@ -159,8 +159,9 @@ class TestBackwardCompat:
         sf = SignalFilter(db_path=db)
         acc, n = sf._ticker_accuracy("FLAT")
         pooled = (3 + EB_PRIOR_POOL_META * EB_PRIOR_MEAN) / (10 + EB_PRIOR_POOL_META)
-        expected = (3 + EB_PRIOR_STRENGTH * pooled) / (10 + EB_PRIOR_STRENGTH) * 100
-        assert acc == pytest.approx(expected, abs=0.01)
+        # observed 0.3 vs prior 0.4: within 1 SD (0.155) -> JEPA collapse
+        # to the prior (noise discarded); beyond-noise cases still use EB.
+        assert acc == pytest.approx(pooled * 100, abs=0.01)
 
     def test_half_life_constant_sanity(self):
         assert RECENCY_HALF_LIFE_DAYS == 60.0

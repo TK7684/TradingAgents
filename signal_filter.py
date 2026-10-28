@@ -123,16 +123,28 @@ class SignalFilter:
         RECENCY_HALF_LIFE_DAYS); the weighted correct/total then feed the
         beta-binomial shrinkage:
 
-        accuracy = (w_correct + EB_PRIOR_STRENGTH * EB_PRIOR_MEAN) /
+        accuracy = (w_correct + EB_PRIOR_STRENGTH * prior) /
                    (w_total + EB_PRIOR_STRENGTH) * 100
 
         Equal timestamps reduce to the previous unweighted EB estimate.
-        Small samples are still pulled toward 50%.
+        Small samples are still pulled toward the pooled prior.
+
+        STOCK-JEPA prior-anchored revision (arXiv:2610.07006): a deviation
+        of the observed rate from the pooled prior that is within one
+        sampling SD (binomial noise) is unpredictable — collapse to the
+        prior. Only beyond-noise revisions survive shrinkage.
         """
         w_correct, w_total, n = self._weighted_counts(ticker.upper())
         if n == 0:
             return 50.0, 0  # no data = assume neutral
         prior = self._pooled_prior()
+        if w_total > 0:
+            observed = w_correct / w_total
+            noise_sd = (prior * (1.0 - prior) / w_total) ** 0.5
+            if abs(observed - prior) < noise_sd:
+                # Within-noise deviation from the prior is unpredictable
+                # (STOCK-JEPA): discard the residual, report the prior.
+                return prior * 100, n
         shrunk = (w_correct + EB_PRIOR_STRENGTH * prior) / (
             w_total + EB_PRIOR_STRENGTH
         )
@@ -278,10 +290,11 @@ class SignalFilter:
     def _query_ticker_stats(self) -> list[dict]:
         """Query all tickers with 5+ predictions.
 
-        Accuracy is EB-shrunk (same beta-binomial prior as
-        _ticker_accuracy) so the displayed number matches the value the
-        gating decision actually uses; raw correct/total overstates
-        small samples (AGI pattern: small-sample accuracy overfitting).
+        Accuracy comes from _ticker_accuracy itself (single source of
+        truth: EB shrinkage + JEPA noise gate) so the displayed number
+        is exactly the value the gating decision uses; raw correct/total
+        overstates small samples (AGI pattern: small-sample accuracy
+        overfitting).
         """
         conn = sqlite3.connect(self.db_path)
         tickers = [r[0] for r in conn.execute(
@@ -294,13 +307,12 @@ class SignalFilter:
             w_correct, w_total, n = self._weighted_counts(ticker)
             if n < 5:
                 continue
+            gate_acc, _ = self._ticker_accuracy(ticker)
             stats.append({
                 "ticker": ticker,
                 "predictions": n,
                 "correct": round(w_correct, 2),
-                "accuracy": round(
-                    100.0 * (w_correct + EB_PRIOR_STRENGTH * self._pooled_prior())
-                    / (w_total + EB_PRIOR_STRENGTH), 1),
+                "accuracy": round(gate_acc, 1),
             })
         stats.sort(key=lambda s: s["accuracy"])
         return stats

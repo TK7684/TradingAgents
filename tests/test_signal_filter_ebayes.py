@@ -62,7 +62,8 @@ class TestEBShrinkage:
         assert acc == pytest.approx(50.0)
 
     def test_tiny_perfect_sample_is_shrunk_not_100(self, db):
-        # 1/1 correct: raw = 100%, EB = (1 + 2.5) / (1 + 5) = 58.33%
+        # 1/1 correct: raw = 100%, but |1.0 - prior| < 1 binomial SD at
+        # n=1, so the JEPA noise gate collapses it to the pooled prior.
         sf = SignalFilter(db_path=db)
         conn = sqlite3.connect(db)
         _add_prediction(conn, "NVDA", 1)
@@ -71,8 +72,7 @@ class TestEBShrinkage:
         assert n == 1
         # hierarchical: prior target = pooled base rate (here 1/1)
         pooled = (1 + EB_PRIOR_POOL_META * EB_PRIOR_MEAN) / (1 + EB_PRIOR_POOL_META)
-        assert acc == pytest.approx((1 + EB_PRIOR_STRENGTH * pooled)
-                                    / (1 + EB_PRIOR_STRENGTH) * 100)
+        assert acc == pytest.approx(pooled * 100)
 
     def test_tiny_bad_sample_is_shrunk_not_0(self, db):
         # 0/2 correct: raw = 0%, EB = 2.5 / 7 = 35.7% — not catastrophically 0
@@ -100,9 +100,9 @@ class TestEBShrinkage:
         acc, n = sf._ticker_accuracy("T")
         assert n == 100
         pooled = (60 + EB_PRIOR_POOL_META * EB_PRIOR_MEAN) / (100 + EB_PRIOR_POOL_META)
-        assert acc == pytest.approx((60 + EB_PRIOR_STRENGTH * pooled)
-                                    / (100 + EB_PRIOR_STRENGTH) * 100, abs=0.01)
-        assert abs(acc - 60.0) < 1.0  # close to raw
+        # observed 0.60 vs prior 0.591: within 1 SD (0.049) -> JEPA collapse
+        assert acc == pytest.approx(pooled * 100, abs=0.01)
+        assert abs(acc - 60.0) < 1.0  # still close to raw
 
     def test_blocking_still_works_on_genuinely_bad_history(self, db):
         # 3/25 = 12% raw; EB = 5.5/30 = 18.3% — still below BLOCK_THRESHOLD=20
@@ -125,6 +125,41 @@ class TestEBShrinkage:
         conn.commit(); conn.close()
         w = sf.get_position_weight("NVDA")
         assert w == pytest.approx(0.75)
+
+
+class TestJEPANoiseGate:
+    """STOCK-JEPA prior-anchored revision (arXiv:2610.07006): within-noise
+    deviations from the pooled prior are unpredictable and collapse to the
+    prior; beyond-noise revisions survive EB shrinkage."""
+
+    def test_within_noise_deviation_collapses_to_prior(self, db):
+        # 4/5: observed 0.8, pooled 0.6, SD = sqrt(.6*.4/5) = 0.219,
+        # dev 0.2 < 0.219 -> exactly the pooled prior, not EB 70%
+        self._seed(db, "TSM", 4, 1)
+        sf = SignalFilter(db_path=db)
+        acc, n = sf._ticker_accuracy("TSM")
+        assert n == 5
+        assert acc == pytest.approx(sf._pooled_prior() * 100)
+
+    def test_beyond_noise_revision_survives_shrinkage(self, db):
+        # 8/8: observed 1.0, pooled clamped 0.70, SD = sqrt(.7*.3/8) = 0.162,
+        # dev 0.30 > 0.162 -> EB path: (8+5*0.7)/(8+5) = 88.5%
+        self._seed(db, "GOOD", 8, 0)
+        sf = SignalFilter(db_path=db)
+        acc, n = sf._ticker_accuracy("GOOD")
+        assert n == 8
+        assert acc == pytest.approx((8 + EB_PRIOR_STRENGTH * 0.70)
+                                    / (8 + EB_PRIOR_STRENGTH) * 100, abs=0.01)
+        assert acc > 80.0  # genuine skill is not collapsed away
+
+    def _seed(self, db, ticker, n_correct, n_wrong):
+        conn = sqlite3.connect(db)
+        for _ in range(n_correct):
+            _add_prediction(conn, ticker, 1)
+        for _ in range(n_wrong):
+            _add_prediction(conn, ticker, 0)
+        conn.commit()
+        conn.close()
 
 
 class TestCLIUnchanged:
@@ -202,12 +237,13 @@ class TestStatsDisplayShrinkage:
         conn.close()
 
     def test_stats_accuracy_is_shrunk(self, db):
-        # 4/5 raw = 80%; hierarchical EB: pooled=(4+5)/(5+10)=0.6,
-        # acc = (4+5*0.6)/(5+5) = 70% — still shrunk well below raw 80%
+        # 4/5 raw = 80%; pooled=(4+5)/(5+10)=0.6; dev 0.2 < 1 SD (0.219)
+        # so the JEPA noise gate collapses to the pooled prior = 60% —
+        # shrunk even harder below raw 80% than plain EB (70%)
         self._seed(db, "TSM", 4, 1)
         sf = SignalFilter(db_path=db)
         stats = {s["ticker"]: s for s in sf.get_ticker_stats()}
-        assert stats["TSM"]["accuracy"] == pytest.approx(70.0, abs=0.05)
+        assert stats["TSM"]["accuracy"] == pytest.approx(60.0, abs=0.05)
 
     def test_stats_raw_fields_preserved(self, db):
         self._seed(db, "TSM", 4, 1)
