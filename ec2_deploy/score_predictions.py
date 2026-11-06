@@ -53,6 +53,9 @@ def get_actual_signal(ticker: str, date_str: str, horizon_days: int = 5) -> tupl
     
     Returns:
         (signal, details_dict) where details has pct_change, horizon, prices, etc.
+        signal is None when price data is unavailable (ungradeable) — the
+        caller must leave actual_signal NULL instead of fabricating a HOLD
+        grade (NEGATIVE-DATA LAW: fabricated grades pollute EB accuracy).
     """
     dt = datetime.strptime(date_str, "%Y-%m-%d")
     # Fetch enough data: signal date - 2 days to target + 10 buffer
@@ -65,7 +68,7 @@ def get_actual_signal(ticker: str, date_str: str, horizon_days: int = 5) -> tupl
     try:
         hist = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
         if hist.empty:
-            return "HOLD", details
+            return None, details
 
         # Find close on signal date
         close_0 = None
@@ -74,7 +77,7 @@ def get_actual_signal(ticker: str, date_str: str, horizon_days: int = 5) -> tupl
                 close_0 = float(row["Close"])
                 break
         if close_0 is None:
-            return "HOLD", details
+            return None, details
 
         details["close_0"] = close_0
 
@@ -88,7 +91,7 @@ def get_actual_signal(ticker: str, date_str: str, horizon_days: int = 5) -> tupl
                 break
 
         if close_N is None:
-            return "HOLD", details
+            return None, details
 
         details["close_N"] = close_N
         pct_change = (close_N - close_0) / close_0
@@ -101,7 +104,7 @@ def get_actual_signal(ticker: str, date_str: str, horizon_days: int = 5) -> tupl
 
     except Exception as e:
         print(f"  Error getting price for {ticker}: {e}")
-        return "HOLD", details
+        return None, details
 
 
 def main():
@@ -143,6 +146,9 @@ def main():
     for row in rows:
         ticker = row["ticker"]
         actual, details = get_actual_signal(ticker, date_str)
+        if actual is None:
+            print(f"  {ticker}: no price data — left ungraded (actual_signal stays NULL)")
+            continue
         updated = engine.record_outcome(ticker, date_str, actual)
         pct_str = f"{details['pct_change']:+.2f}%" if details['pct_change'] is not None else "N/A"
         print(f"  {ticker}: actual={actual} ({pct_str} over {details['horizon']}d) — {updated} graded")

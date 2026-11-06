@@ -53,11 +53,12 @@ class TestCostConstant:
         assert 0.0005 <= ROUND_TRIP_COST <= 0.005
 
     def test_get_actual_signal_exposes_cost_in_details(self):
-        # No network: yfinance fetch returns empty hist -> HOLD path.
-        # We can't easily force details population without network, so we
-        # assert the function signature still returns (signal, details).
+        # No network: yfinance fetch returns empty hist -> ungradeable path.
+        # NEGATIVE-DATA LAW (2026-11-06): missing price data must return
+        # signal=None so the caller leaves actual_signal NULL — a fabricated
+        # HOLD would pollute EB accuracy stats with fake failures.
         sig, det = get_actual_signal("ZZZZZZ", "2026-09-01")
-        assert sig == "HOLD"
+        assert sig is None
         assert isinstance(det, dict)
 
 
