@@ -36,6 +36,8 @@ dependencies = [
     "tradingview-screener>=2.5.0",
     "rookiepy>=0.4.0",
     "matplotlib>=3.8.0",
+    "python-dateutil>=2.9.0",
+    "numpy>=1.26.0",
 ]
 
 [project.scripts]
