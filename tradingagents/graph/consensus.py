@@ -115,6 +115,16 @@ FORWARD_GATE_MIN_PREDICTIONS: int = 20
 # Number of recent predictions to validate against.
 FORWARD_GATE_WINDOW: int = 20
 
+# Task-Conditioned Panel Selection (arxiv:2611.22998v1 "Who Should Be on the
+# Panel? Task-Conditioned Persona Selection for LLM Trading Agents"): the
+# panel is conditioned on proven skill, not static roles.  A source is
+# benched (left off the panel) when it has enough graded predictions to be
+# judged AND its Wilson lower-bound accuracy is below the bench threshold.
+PANEL_MIN_GRADED: int = 15
+# 0.30 keeps a 61%-accurate source seated (Wilson LB ~0.39 at n=18) while
+# benching genuinely anti-skilled ones (28% -> LB ~0.12).
+PANEL_BENCH_WILSON: float = 0.30
+
 #: Wilson score interval z-value (95% confidence).  Used to compute a
 #: conservative lower bound on per-source accuracy so that sources with a
 #: handful of lucky predictions cannot outrank consistently proven sources.
@@ -778,6 +788,53 @@ class AccuracyTracker:
 
         return {src: round(w / total, 4) for src, w in raw.items()}
 
+    def get_panel(self) -> Tuple[list, Dict[str, float]]:
+        """Task-conditioned panel selection: which sources get a seat.
+
+        Benches a source when it has >= ``PANEL_MIN_GRADED`` graded
+        predictions and its Wilson lower-bound accuracy falls below
+        ``PANEL_BENCH_WILSON``.  Falls back to the full panel when there is
+        too little evidence overall, or when benching would leave fewer than
+        2 seated sources (a one-voice panel is not a panel).
+
+        Returns:
+            ``(seated_sources, weights)`` — weights renormalised over the
+            seated sources only (they sum to 1.0).
+        """
+        weights = self.get_weights()
+        stats = self.get_source_stats()
+        total_graded = sum(s["total"] for s in stats.values())
+        if total_graded < MIN_PREDICTIONS_FOR_WEIGHTING:
+            return list(SOURCES), weights
+
+        bench = [
+            src for src in SOURCES
+            if stats.get(src, {}).get("total", 0) >= PANEL_MIN_GRADED
+            and _wilson_lower_bound(
+                int(stats[src].get("correct", 0)),
+                int(stats[src].get("total", 0)),
+            ) < PANEL_BENCH_WILSON
+        ]
+        seated = [src for src in SOURCES if src not in bench]
+        if len(seated) < 2:
+            if bench:
+                log.info(
+                    "Panel fallback: benching %s would leave <2 seated; full panel retained",
+                    bench,
+                )
+            return list(SOURCES), weights
+
+        seated_w = sum(weights.get(src, 0.0) for src in seated)
+        if seated_w <= 0:
+            equal = 1.0 / len(seated)
+            return seated, {src: round(equal, 4) for src in seated}
+        if bench:
+            log.info(
+                "Panel selection: benched %s (Wilson LB < %.2f with >=%d graded)",
+                bench, PANEL_BENCH_WILSON, PANEL_MIN_GRADED,
+            )
+        return seated, {src: round(weights[src] / seated_w, 4) for src in seated}
+
 
 # ---------------------------------------------------------------------------
 # Confidence Scorer
@@ -813,33 +870,65 @@ class ConfidenceScorer:
         - Disagreement penalty: if tiers disagree, the majority signal loses
           confidence (the minority voice has historically been valuable).
         """
+        # --- Task-conditioned panel selection ---
+        # Only proven sources get a seat (see AccuracyTracker.get_panel).
+        # With insufficient history (or an over-benching edge case) the full
+        # 4-source panel is retained, preserving legacy behaviour.
+        seated, _panel_weights = (
+            self._tracker.get_panel() if self._tracker is not None
+            else (list(SOURCES), {})
+        )
+        ij_seated = "investment_judge" in seated
+        exec_members = [
+            s for s in ("trader", "risk_judge", "portfolio_manager") if s in seated
+        ]
+        if not ij_seated and not exec_members:
+            seated = list(SOURCES)
+            ij_seated = True
+            exec_members = ["trader", "risk_judge", "portfolio_manager"]
+
         # --- Tiered voting ---
-        ij_signal = source_signals.get("investment_judge", "HOLD")
+        ij_signal = (
+            source_signals.get("investment_judge", "HOLD") if ij_seated else None
+        )
         exec_signals = [
-            source_signals.get("trader", "HOLD"),
-            source_signals.get("risk_judge", "HOLD"),
-            source_signals.get("portfolio_manager", "HOLD"),
+            source_signals.get(s, "HOLD") for s in exec_members
         ]
         # Majority vote within execution block
         exec_tally: Dict[str, int] = {}
         for s in exec_signals:
             exec_tally[s] = exec_tally.get(s, 0) + 1
-        exec_signal = max(exec_tally, key=lambda k: (exec_tally[k], k))
+        exec_signal = (
+            max(exec_tally, key=lambda k: (exec_tally[k], k)) if exec_tally else None
+        )
+
+        # Effective tier weights over seated members only (sum to 1.0)
+        ij_w = INVESTMENT_JUDGE_WEIGHT if ij_signal is not None else 0.0
+        exec_w = EXECUTION_BLOCK_WEIGHT if exec_signal is not None else 0.0
+        tier_norm = ij_w + exec_w
+        if tier_norm > 0:
+            ij_w /= tier_norm
+            exec_w /= tier_norm
 
         # Weighted tally (2 tiers)
         tally: Dict[str, float] = {"BUY": 0.0, "HOLD": 0.0, "SELL": 0.0}
-        tally[ij_signal] += INVESTMENT_JUDGE_WEIGHT
-        tally[exec_signal] += EXECUTION_BLOCK_WEIGHT
+        if ij_signal is not None:
+            tally[ij_signal] += ij_w
+        if exec_signal is not None:
+            tally[exec_signal] += exec_w
 
         final_signal = max(tally, key=lambda k: tally[k])
         consensus_level = tally[final_signal]  # 0.0 – 1.0 since weights sum to 1.0
 
-        # --- Unanimity check (original 4-source) ---
-        signals_set = set(source_signals.get(src, "HOLD") for src in SOURCES)
+        # --- Unanimity check (seated sources only) ---
+        signals_set = set(source_signals.get(src, "HOLD") for src in seated)
         unanimous = len(signals_set) == 1
 
         # --- Anti-BUY-bias corrections ---
-        tiers_disagree = (ij_signal != exec_signal)
+        tiers_disagree = (
+            ij_signal is not None and exec_signal is not None
+            and ij_signal != exec_signal
+        )
         buy_correction = 0.0
 
         if final_signal == "BUY":
@@ -913,10 +1002,10 @@ class ConfidenceScorer:
 
         recommendation = self._build_recommendation(final_signal, confidence, unanimous)
 
-        # Build display weights (show effective tier weights, not per-source)
+        # Build display weights (effective tier weights after panel selection)
         display_weights = {
-            "investment_judge": INVESTMENT_JUDGE_WEIGHT,
-            "execution_block": EXECUTION_BLOCK_WEIGHT,
+            "investment_judge": round(ij_w, 4),
+            "execution_block": round(exec_w, 4),
         }
 
         log.info(
