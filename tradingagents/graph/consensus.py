@@ -476,6 +476,7 @@ class AccuracyTracker:
             date        TEXT    NOT NULL,
             source      TEXT    NOT NULL,
             predicted_signal TEXT NOT NULL,
+            task_type        TEXT    NOT NULL DEFAULT 'default',
             actual_signal    TEXT,
             correct     INTEGER,
             created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -575,6 +576,14 @@ class AccuracyTracker:
             conn.execute("UPDATE drl_qtable SET q_value_b = q_value")
         except sqlite3.OperationalError:
             pass  # column already exists
+        # Migration: task-conditioned panel selection (H20261119150056-3)
+        # backfills the task_type column on predictions.
+        try:
+            conn.execute(
+                "ALTER TABLE predictions ADD COLUMN task_type TEXT NOT NULL DEFAULT 'default'"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.commit()
 
     def close(self) -> None:
@@ -590,6 +599,7 @@ class AccuracyTracker:
         date_str: str,
         source: str,
         predicted_signal: str,
+        task_type: str = "default",
     ) -> None:
         """Insert a prediction record.
 
@@ -602,9 +612,9 @@ class AccuracyTracker:
         conn = self._get_conn()
         try:
             conn.execute(
-                "INSERT INTO predictions (ticker, date, source, predicted_signal) "
-                "VALUES (?, ?, ?, ?)",
-                (ticker, date_str, source, predicted_signal.upper()),
+                "INSERT INTO predictions (ticker, date, source, predicted_signal, task_type) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (ticker, date_str, source, predicted_signal.upper(), task_type),
             )
             conn.commit()
         except sqlite3.IntegrityError:
@@ -703,6 +713,37 @@ class AccuracyTracker:
             for row in rows
         }
 
+    def get_task_source_stats(self, task_type: str) -> Dict[str, Dict[str, Any]]:
+        """Accuracy statistics per source, restricted to one task type.
+
+        Computed live from the ``predictions`` table (the ``source_stats``
+        cache is global-only).  Same shape as :meth:`get_source_stats`.
+
+        Returns:
+            ``{source: {"total": int, "correct": int, "accuracy": float,
+                       "shrunk_accuracy": float}}``
+        """
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT source, COUNT(*) AS total, "
+            "SUM(CASE WHEN correct = 1 THEN 1 ELSE 0 END) AS correct "
+            "FROM predictions "
+            "WHERE actual_signal IS NOT NULL AND task_type = ? "
+            "GROUP BY source",
+            (task_type,),
+        ).fetchall()
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            total = int(row["total"])
+            correct = int(row["correct"])
+            out[row["source"]] = {
+                "total": total,
+                "correct": correct,
+                "accuracy": round(correct / total, 4) if total else 0.0,
+                "shrunk_accuracy": round(_wilson_lower_bound(correct, total), 4),
+            }
+        return out
+
     def get_ticker_stats(self) -> Dict[str, Dict[str, Any]]:
         """Return accuracy statistics per ticker.
 
@@ -788,7 +829,9 @@ class AccuracyTracker:
 
         return {src: round(w / total, 4) for src, w in raw.items()}
 
-    def get_panel(self) -> Tuple[list, Dict[str, float]]:
+    def get_panel(
+        self, task_type: Optional[str] = None
+    ) -> Tuple[list, Dict[str, float]]:
         """Task-conditioned panel selection: which sources get a seat.
 
         Benches a source when it has >= ``PANEL_MIN_GRADED`` graded
@@ -797,12 +840,36 @@ class AccuracyTracker:
         too little evidence overall, or when benching would leave fewer than
         2 seated sources (a one-voice panel is not a panel).
 
+        When *task_type* is given, seating is decided by that source's
+        accuracy **within the task** (a source can be benched for one task
+        type while keeping its seat for others).  Weights always come from
+        the global history — per-task samples are too thin to weight on, but
+        thick enough to decide seating.  With fewer than
+        ``MIN_PREDICTIONS_FOR_WEIGHTING`` graded predictions inside the task,
+        the task stats are discarded and the global panel is used.
+
         Returns:
             ``(seated_sources, weights)`` — weights renormalised over the
             seated sources only (they sum to 1.0).
         """
         weights = self.get_weights()
         stats = self.get_source_stats()
+        if task_type is not None:
+            task_stats = self.get_task_source_stats(task_type)
+            task_graded = sum(s["total"] for s in task_stats.values())
+            if task_graded >= MIN_PREDICTIONS_FOR_WEIGHTING:
+                stats = task_stats
+            else:
+                log.info(
+                    "Task panel %r: only %d graded (< %d); global panel stats used",
+                    task_type, task_graded, MIN_PREDICTIONS_FOR_WEIGHTING,
+                )
+        return self._select_panel(weights, stats)
+
+    def _select_panel(
+        self, weights: Dict[str, float], stats: Dict[str, Dict[str, Any]]
+    ) -> Tuple[list, Dict[str, float]]:
+        """Seat/bench decision shared by the global and task panels."""
         total_graded = sum(s["total"] for s in stats.values())
         if total_graded < MIN_PREDICTIONS_FOR_WEIGHTING:
             return list(SOURCES), weights
@@ -854,6 +921,7 @@ class ConfidenceScorer:
         self,
         source_signals: Dict[str, str],
         source_extractions: Optional[Dict[str, ExtractionResult]] = None,
+        task_type: Optional[str] = None,
     ) -> ConsensusResult:
         """Score a set of per-source signals with anti-bias corrections.
 
@@ -875,7 +943,7 @@ class ConfidenceScorer:
         # With insufficient history (or an over-benching edge case) the full
         # 4-source panel is retained, preserving legacy behaviour.
         seated, _panel_weights = (
-            self._tracker.get_panel() if self._tracker is not None
+            self._tracker.get_panel(task_type=task_type) if self._tracker is not None
             else (list(SOURCES), {})
         )
         ij_seated = "investment_judge" in seated
@@ -1138,6 +1206,7 @@ class DRLWeightedScorer:
         source_signals: Dict[str, str],
         source_extractions: Optional[Dict[str, ExtractionResult]] = None,
         regime_return: Optional[float] = None,
+        task_type: Optional[str] = None,
     ) -> ConsensusResult:
         """Score signals, blending DRL-adjusted weights into the result.
 
@@ -1150,7 +1219,9 @@ class DRLWeightedScorer:
             DRL-blended per-source weights.
         """
         # Run the base scorer first (unchanged logic)
-        result = self._base_scorer.score(source_signals, source_extractions)
+        result = self._base_scorer.score(
+            source_signals, source_extractions, task_type=task_type
+        )
 
         # Compute DRL-blended weights
         drl_weights = self.get_blended_weights(
