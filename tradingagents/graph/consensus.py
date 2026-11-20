@@ -942,7 +942,7 @@ class ConfidenceScorer:
         # Only proven sources get a seat (see AccuracyTracker.get_panel).
         # With insufficient history (or an over-benching edge case) the full
         # 4-source panel is retained, preserving legacy behaviour.
-        seated, _panel_weights = (
+        seated, panel_weights = (
             self._tracker.get_panel(task_type=task_type) if self._tracker is not None
             else (list(SOURCES), {})
         )
@@ -973,6 +973,22 @@ class ConfidenceScorer:
         # Effective tier weights over seated members only (sum to 1.0)
         ij_w = INVESTMENT_JUDGE_WEIGHT if ij_signal is not None else 0.0
         exec_w = EXECUTION_BLOCK_WEIGHT if exec_signal is not None else 0.0
+
+        # --- Confidence-weighted voting (H20261120150051-3) ---
+        # Scale each tier's vote by the mean Wilson-LB panel weight of its
+        # seated members, so a tier stacked with unproven sources loses
+        # influence. Equal weights (thin history) cancel in the normalisation
+        # below, preserving the legacy fixed 0.60/0.40 split exactly.
+        if panel_weights:
+            def _tier_conf(members: list) -> float:
+                w = [panel_weights[m] for m in members if m in panel_weights]
+                return sum(w) / len(w) if w else 1.0
+
+            if ij_signal is not None:
+                ij_w *= _tier_conf(["investment_judge"])
+            if exec_signal is not None:
+                exec_w *= _tier_conf(exec_members)
+
         tier_norm = ij_w + exec_w
         if tier_norm > 0:
             ij_w /= tier_norm
