@@ -278,6 +278,13 @@ class TradingAgentsGraph:
         # Return decision and processed signal
         signal = self.process_signal(final_state["final_trade_decision"])
 
+        # Evidence gate (transfer of H20261121150120: route by evidence-
+        # backed confidence, not static priors): multiply the LLM's
+        # directional confidence by the ticker's EB-shrunk realized
+        # accuracy ledger before releasing the signal. Mirrors the gate
+        # convention already deployed in ec2_deploy/paper_trader.py.
+        signal = self._evidence_gate(final_state["company_of_interest"], signal)
+
         # Run consensus voting across all 4 decision points
         consensus_results = self.consensus_engine.evaluate(self.log_states_dict)
         # Get the result for this trade_date
@@ -357,3 +364,40 @@ class TradingAgentsGraph:
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""
         return self.signal_processor.process_signal(full_signal)
+
+    def _evidence_gate(self, ticker, signal, signal_filter=None):
+        """Ledger-backed downgrade of directional signals (H20261122-evidence-gate).
+
+        A BLOCK from SignalFilter means the ticker's EB-shrunk realized
+        accuracy (or signal inversion) says this direction is historically
+        unprofitable -> release HOLD instead of the LLM's guess. WARN keeps
+        the signal (the caller/position sizer downweights, as in
+        paper_trader.get_position_weight). Fail-open on any ledger error:
+        the gate must never break the pipeline it protects.
+        """
+        if signal not in ("BUY", "OVERWEIGHT", "SELL", "UNDERWEIGHT"):
+            return signal
+        try:
+            if signal_filter is None:
+                import os
+                import sys
+                root = os.path.expanduser("~/TradingAgents")
+                if root not in sys.path:
+                    sys.path.insert(0, root)
+                from signal_filter import SignalFilter
+                signal_filter = SignalFilter()
+            allowed, reason = signal_filter.should_trade(
+                str(ticker).upper(), signal
+            )
+            if not allowed:
+                log.warning(
+                    "Evidence gate: %s %s downgraded to HOLD (%s)",
+                    ticker, signal, reason,
+                )
+                return "HOLD"
+            if reason.startswith("WARN"):
+                log.info("Evidence gate: %s %s allowed (%s)", ticker, signal, reason)
+            return signal
+        except Exception as e:
+            log.warning("Evidence gate unavailable, fail-open (%s)", e)
+            return signal
